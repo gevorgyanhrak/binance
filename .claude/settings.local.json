@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(BROWSER=none npm start *)",
+      "Bash(lsof -nP -iTCP:3000 -sTCP:LISTEN)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}  %{size_download}B  %{time_total}s\\\\n\" http://localhost:3000)",
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(ps -p 63931 -o pid,ppid,command)",
+      "Bash(BROWSER=none PORT=3001 npm start *)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:3001)",
+      "Bash(curl -s http://localhost:3001)"
+    ]
+  }
+}
