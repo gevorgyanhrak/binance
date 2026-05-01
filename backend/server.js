@@ -1,54 +1,72 @@
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
-const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { getAdapter, listAdapters } = require("./adapters");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
-const BASE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search";
-const HISTORY_FILE = path.join(__dirname, "history.json");
 const REFRESH_INTERVAL_MS = 30_000;
 const RETENTION_MS = 31 * 24 * 60 * 60 * 1000;
+const HISTORY_DIR = path.join(__dirname, "history");
+if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
 
-let history = [];
-if (fs.existsSync(HISTORY_FILE)) {
+const PERIOD_MS = {
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+};
+const MAX_CHART_POINTS = 180;
+
+const state = {};
+
+function historyFile(exchangeId) {
+  const legacy = path.join(__dirname, "history.json");
+  if (exchangeId === "binance" && fs.existsSync(legacy)) return legacy;
+  return path.join(HISTORY_DIR, `${exchangeId}.json`);
+}
+
+function loadHistory(exchangeId) {
+  const file = historyFile(exchangeId);
+  if (!fs.existsSync(file)) return [];
   try {
-    history = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf8"));
-    if (!Array.isArray(history)) history = [];
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    history = [];
+    return [];
   }
 }
 
-function pruneAndPersist() {
+function persistHistory(exchangeId, history) {
+  const file = historyFile(exchangeId);
   const cutoff = Date.now() - RETENTION_MS;
-  history = history.filter((s) => s.t >= cutoff);
-  fs.writeFile(HISTORY_FILE, JSON.stringify(history), () => {});
+  const pruned = history.filter((s) => s.t >= cutoff);
+  fs.writeFile(file, JSON.stringify(pruned), () => {});
+  return pruned;
 }
 
-async function fetchP2P(tradeType) {
-  const res = await axios.post(BASE_URL, {
-    page: 1,
-    rows: 10,
-    payTypes: [],
-    asset: "USDT",
-    fiat: "AMD",
-    tradeType,
-  });
-  return res.data.data.map((item) => ({
-    price: parseFloat(item.adv.price),
-    min: parseFloat(item.adv.minSingleTransAmount),
-    max: parseFloat(item.adv.dynamicMaxSingleTransAmount),
-    merchant: item.advertiser.nickName,
-  }));
+function getState(exchangeId) {
+  if (!state[exchangeId]) {
+    state[exchangeId] = {
+      cache: null,
+      refreshing: null,
+      history: loadHistory(exchangeId),
+    };
+  }
+  return state[exchangeId];
 }
 
-async function buildSnapshot() {
-  const [buy, sell] = await Promise.all([fetchP2P("BUY"), fetchP2P("SELL")]);
+async function buildSnapshot(adapter) {
+  const [buy, sell] = await Promise.all([
+    adapter.fetchP2P({ tradeType: "BUY" }),
+    adapter.fetchP2P({ tradeType: "SELL" }),
+  ]);
+  if (!buy.length || !sell.length) {
+    const which = !buy.length && !sell.length ? "both sides" : !buy.length ? "buy side" : "sell side";
+    throw new Error(`empty order book (${which})`);
+  }
   const bestBuy = buy[0];
   const bestSell = sell[0];
   const spread = bestSell.price - bestBuy.price;
@@ -63,17 +81,15 @@ async function buildSnapshot() {
   };
 }
 
-let cache = null;
-let refreshing = null;
-
-async function refresh() {
-  if (refreshing) return refreshing;
-  refreshing = (async () => {
+async function refresh(adapter) {
+  const s = getState(adapter.id);
+  if (s.refreshing) return s.refreshing;
+  s.refreshing = (async () => {
     try {
-      const data = await buildSnapshot();
+      const data = await buildSnapshot(adapter);
       const t = Date.now();
-      cache = { data, t };
-      history.push({
+      s.cache = { data, t };
+      s.history.push({
         t,
         buyPrice: data.bestBuy.price,
         sellPrice: data.bestSell.price,
@@ -82,36 +98,21 @@ async function refresh() {
         buyPrices: data.buy.slice(0, 10).map((b) => b.price),
         sellPrices: data.sell.slice(0, 10).map((s) => s.price),
       });
-      pruneAndPersist();
+      s.history = persistHistory(adapter.id, s.history);
     } catch (err) {
-      console.error("Refresh failed:", err.message);
+      console.error(`[${adapter.id}] refresh failed:`, err.message);
     } finally {
-      refreshing = null;
+      s.refreshing = null;
     }
   })();
-  return refreshing;
+  return s.refreshing;
 }
 
-setInterval(refresh, REFRESH_INTERVAL_MS);
-refresh();
-
-app.get("/api/p2p", async (req, res) => {
-  try {
-    if (!cache) await refresh();
-    if (!cache) return res.status(503).json({ error: "No data available yet" });
-    res.json({ ...cache.data, updatedAt: cache.t });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PERIOD_MS = {
-  day: 24 * 60 * 60 * 1000,
-  week: 7 * 24 * 60 * 60 * 1000,
-  month: 30 * 24 * 60 * 60 * 1000,
-};
-
-const MAX_CHART_POINTS = 180;
+for (const meta of listAdapters()) {
+  const adapter = getAdapter(meta.id);
+  refresh(adapter);
+  setInterval(() => refresh(adapter), REFRESH_INTERVAL_MS);
+}
 
 function downsample(arr, max) {
   if (arr.length <= max) return arr;
@@ -124,35 +125,56 @@ function downsample(arr, max) {
   return out;
 }
 
-app.get("/api/history", (req, res) => {
+app.get("/api/exchanges", (req, res) => {
+  res.json({ exchanges: listAdapters() });
+});
+
+function withAdapter(req, res, next) {
+  const adapter = getAdapter(req.params.exchange);
+  if (!adapter) return res.status(404).json({ error: "Unknown exchange" });
+  req.adapter = adapter;
+  next();
+}
+
+app.get("/api/:exchange/p2p", withAdapter, async (req, res) => {
+  const adapter = req.adapter;
+  const s = getState(adapter.id);
+  try {
+    if (!s.cache) await refresh(adapter);
+    if (!s.cache) return res.status(503).json({ error: "No data available yet" });
+    res.json({ ...s.cache.data, updatedAt: s.cache.t });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/:exchange/history", withAdapter, (req, res) => {
   const period = String(req.query.period || "day");
   const ms = PERIOD_MS[period];
   if (!ms) {
     return res.status(400).json({ error: "Invalid period. Use day|week|month." });
   }
-
+  const s = getState(req.adapter.id);
   const cutoff = Date.now() - ms;
-  const slice = history.filter((s) => s.t >= cutoff);
+  const slice = s.history.filter((x) => x.t >= cutoff);
 
   if (slice.length === 0) {
     return res.json({ period, dataPoints: 0, snapshots: [], aggregates: null });
   }
 
-  const buyPrices = slice.map((s) => s.buyPrice);
-  const sellPrices = slice.map((s) => s.sellPrice);
-  const spreads = slice.map((s) => s.spread);
-  const profits = slice.map((s) => s.profitPercent);
+  const buyPrices = slice.map((x) => x.buyPrice);
+  const sellPrices = slice.map((x) => x.sellPrice);
+  const spreads = slice.map((x) => x.spread);
+  const profits = slice.map((x) => x.profitPercent);
   const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
   const POSITIONS = 10;
   const buyByPos = Array.from({ length: POSITIONS }, () => []);
   const sellByPos = Array.from({ length: POSITIONS }, () => []);
 
-  for (const s of slice) {
-    const bps =
-      s.buyPrices || (s.buyPrice !== undefined ? [s.buyPrice] : []);
-    const sps =
-      s.sellPrices || (s.sellPrice !== undefined ? [s.sellPrice] : []);
+  for (const x of slice) {
+    const bps = x.buyPrices || (x.buyPrice !== undefined ? [x.buyPrice] : []);
+    const sps = x.sellPrices || (x.sellPrice !== undefined ? [x.sellPrice] : []);
     for (let i = 0; i < POSITIONS; i++) {
       if (bps[i] !== undefined) buyByPos[i].push(bps[i]);
       if (sps[i] !== undefined) sellByPos[i].push(sps[i]);
@@ -172,10 +194,10 @@ app.get("/api/history", (req, res) => {
   res.json({
     period,
     dataPoints: slice.length,
-    snapshots: downsample(slice, MAX_CHART_POINTS).map((s) => ({
-      t: s.t,
-      buyPrice: s.buyPrices?.[0] ?? s.buyPrice,
-      sellPrice: s.sellPrices?.[0] ?? s.sellPrice,
+    snapshots: downsample(slice, MAX_CHART_POINTS).map((x) => ({
+      t: x.t,
+      buyPrice: x.buyPrices?.[0] ?? x.buyPrice,
+      sellPrice: x.sellPrices?.[0] ?? x.sellPrice,
     })),
     positions: {
       buy: buyByPos.map(statsFor),
@@ -199,57 +221,41 @@ app.get("/api/history", (req, res) => {
   });
 });
 
-const BINANCE_API_BASE = "https://api.binance.com";
-const UPDATE_AD_PATH = "/sapi/v1/c2c/ads/update";
-
-function signQuery(params, secret) {
-  const query = new URLSearchParams(params).toString();
-  const signature = crypto
-    .createHmac("sha256", secret)
-    .update(query)
-    .digest("hex");
-  return `${query}&signature=${signature}`;
-}
-
-async function updateBinanceAd({ apiKey, apiSecret, adNo, price }) {
-  const params = {
-    adsNo: adNo,
-    price: String(price),
-    timestamp: Date.now(),
-    recvWindow: 5000,
-  };
-  const signedQuery = signQuery(params, apiSecret);
-  const url = `${BINANCE_API_BASE}${UPDATE_AD_PATH}?${signedQuery}`;
-  const response = await axios.post(url, null, {
-    headers: { "X-MBX-APIKEY": apiKey },
-    timeout: 15000,
-  });
-  return response.data;
-}
-
-app.post("/api/binance/update-ad", async (req, res) => {
+app.post("/api/:exchange/update-ad", withAdapter, async (req, res) => {
+  const adapter = req.adapter;
+  if (!adapter.updateAd) {
+    return res
+      .status(501)
+      .json({ ok: false, error: `update-ad not implemented for ${adapter.id}` });
+  }
   const { apiKey, apiSecret, adNo, price } = req.body || {};
   if (!apiKey || !apiSecret || !adNo || price === undefined) {
     return res
       .status(400)
       .json({ ok: false, error: "Missing apiKey, apiSecret, adNo or price" });
   }
-
   try {
-    const data = await updateBinanceAd({ apiKey, apiSecret, adNo, price });
+    const data = await adapter.updateAd({ apiKey, apiSecret, adNo, price });
     res.json({ ok: true, data });
   } catch (err) {
     const status = err.response?.status || 500;
     const body = err.response?.data;
     res.status(status).json({
       ok: false,
-      error: body?.msg || body?.message || err.message || "Binance error",
+      error: body?.msg || body?.message || err.message || "Adapter error",
       code: body?.code,
       raw: body,
     });
   }
 });
 
+app.get("/api/p2p", (req, res) => res.redirect(307, "/api/binance/p2p"));
+app.get("/api/history", (req, res) => {
+  const qs = new URLSearchParams(req.query).toString();
+  res.redirect(307, `/api/binance/history${qs ? `?${qs}` : ""}`);
+});
+
 app.listen(4000, () => {
   console.log("Server running on http://localhost:4000");
+  console.log("Loaded exchanges:", listAdapters().map((a) => a.id).join(", "));
 });
