@@ -330,6 +330,33 @@ function pickBestNetwork(fromId, toId) {
   return best || { network: null, fee: 1 };
 }
 
+function aggregateBook(orders, amount) {
+  let filled = 0;
+  let value = 0;
+  const used = [];
+  for (const o of orders) {
+    if (filled >= amount) break;
+    if (!Number.isFinite(o.price) || o.price <= 0) continue;
+    const usdtMaxFromAd = o.max / o.price;
+    const usdtMinFromAd = o.min / o.price;
+    const remaining = amount - filled;
+    if (remaining < usdtMinFromAd) continue;
+    const take = Math.min(usdtMaxFromAd, remaining);
+    filled += take;
+    value += take * o.price;
+    used.push({ price: o.price, merchant: o.merchant, usdt: take });
+  }
+  if (filled < amount * 0.999) return null;
+  return {
+    effectivePrice: value / filled,
+    usdtFilled: filled,
+    used,
+    topPrice: used[0]?.price ?? null,
+    topMerchant: used[0]?.merchant ?? null,
+    adsUsed: used.length,
+  };
+}
+
 function computeAudit({ amount = 1000, feeOverride = null }) {
   const adapters = listAdapters().map((m) => getAdapter(m.id));
   const snapshots = adapters.map((adapter) => {
@@ -344,16 +371,8 @@ function computeAudit({ amount = 1000, feeOverride = null }) {
       exchanges.push({ id: snap.id, label: snap.label, error: snap.error || "no data" });
       continue;
     }
-    const fillsAmount = (order) => {
-      if (!order || !Number.isFinite(order.price) || order.price <= 0) return false;
-      const usdtMin = order.min / order.price;
-      const usdtMax = order.max / order.price;
-      return usdtMin <= amount && amount <= usdtMax;
-    };
-    const buyOrders = (snap.data.buy || []).filter(fillsAmount);
-    const sellOrders = (snap.data.sell || []).filter(fillsAmount);
-    const bestAsk = buyOrders[0] || null;
-    const bestBid = sellOrders[0] || null;
+    const bestAsk = aggregateBook(snap.data.buy || [], amount);
+    const bestBid = aggregateBook(snap.data.sell || [], amount);
     exchanges.push({
       id: snap.id,
       label: snap.label,
@@ -368,8 +387,8 @@ function computeAudit({ amount = 1000, feeOverride = null }) {
     if (!buyEx.bestAsk) continue;
     for (const sellEx of exchanges) {
       if (!sellEx.bestBid) continue;
-      const buyPrice = buyEx.bestAsk.price;
-      const sellPrice = sellEx.bestBid.price;
+      const buyPrice = buyEx.bestAsk.effectivePrice;
+      const sellPrice = sellEx.bestBid.effectivePrice;
       const route = pickBestNetwork(buyEx.id, sellEx.id);
       const transferFee = feeOverride !== null ? feeOverride : route.fee;
       const usdtAfterFee = amount - transferFee;
@@ -384,17 +403,17 @@ function computeAudit({ amount = 1000, feeOverride = null }) {
           exchange: buyEx.id,
           label: buyEx.label,
           price: buyPrice,
-          merchant: buyEx.bestAsk.merchant,
-          min: buyEx.bestAsk.min,
-          max: buyEx.bestAsk.max,
+          topPrice: buyEx.bestAsk.topPrice,
+          merchant: buyEx.bestAsk.topMerchant,
+          adsUsed: buyEx.bestAsk.adsUsed,
         },
         sell: {
           exchange: sellEx.id,
           label: sellEx.label,
           price: sellPrice,
-          merchant: sellEx.bestBid.merchant,
-          min: sellEx.bestBid.min,
-          max: sellEx.bestBid.max,
+          topPrice: sellEx.bestBid.topPrice,
+          merchant: sellEx.bestBid.topMerchant,
+          adsUsed: sellEx.bestBid.adsUsed,
         },
         sameExchange: buyEx.id === sellEx.id,
         network: route.network,

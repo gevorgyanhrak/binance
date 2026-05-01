@@ -72,7 +72,10 @@
       "Bash(awk NR==839 || NR==840 {print NR\": [\"$0\"]\"} *)",
       "Bash(python3 *)",
       "Bash(git -C /Users/hrak/Desktop/p2p-bot/frontend log --oneline -- src/pages/AuditDashboard.js)",
-      "Bash(git -C /Users/hrak/Desktop/p2p-bot/frontend status src/pages/AuditDashboard.js)"
+      "Bash(git -C /Users/hrak/Desktop/p2p-bot/frontend status src/pages/AuditDashboard.js)",
+      "Bash(git rm *)",
+      "Bash(sed -i '' 's|bg-accent text-\\\\[rgb\\(var\\(--c-bg\\)\\)\\\\]|bg-accent text-accent-fg|g' src/App.js src/pages/ExchangeDashboard.js)",
+      "Bash(sed -i '' 's|text-\\\\[rgb\\(var\\(--c-bg\\)\\)\\\\]|text-accent-fg|g' src/pages/ExchangeDashboard.js)"
     ]
   }
 }
