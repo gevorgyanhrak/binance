@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const { EventEmitter } = require("events");
 const { getAdapter, listAdapters } = require("./adapters");
 
 const app = express();
@@ -9,6 +10,12 @@ app.use(cors());
 app.use(express.json({ limit: "64kb" }));
 
 const REFRESH_INTERVAL_MS = 30_000;
+const LIVE_REFRESH_INTERVAL_MS = 3_000;
+const auditBus = new EventEmitter();
+auditBus.setMaxListeners(50);
+const ALERT_HISTORY_MAX = 50;
+const recentAlerts = [];
+const lastAlertProfit = new Map();
 const RETENTION_MS = 31 * 24 * 60 * 60 * 1000;
 const HISTORY_DIR = path.join(__dirname, "history");
 if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
@@ -112,6 +119,59 @@ for (const meta of listAdapters()) {
   const adapter = getAdapter(meta.id);
   refresh(adapter);
   setInterval(() => refresh(adapter), REFRESH_INTERVAL_MS);
+}
+
+const liveSettings = {
+  amount: 1000,
+  feeOverride: null,
+  threshold: 1000,
+};
+
+(function startLiveLoop() {
+  const adapters = listAdapters().map((m) => getAdapter(m.id));
+  if (!adapters.length) return;
+  const stride = Math.max(400, Math.floor(LIVE_REFRESH_INTERVAL_MS / adapters.length));
+  adapters.forEach((adapter, idx) => {
+    setTimeout(() => {
+      const tick = async () => {
+        try {
+          await refresh(adapter);
+          const audit = computeAudit(liveSettings);
+          auditBus.emit("snapshot", audit);
+          detectAlerts(audit);
+        } catch (err) {
+          console.error(`[live ${adapter.id}]`, err.message);
+        }
+      };
+      tick();
+      setInterval(tick, LIVE_REFRESH_INTERVAL_MS);
+    }, idx * stride);
+  });
+})();
+
+function detectAlerts(audit) {
+  const profitable = audit.opportunities.filter(
+    (o) => o.netProfit >= liveSettings.threshold
+  );
+  for (const op of profitable) {
+    const key = `${op.buy.exchange}>${op.sell.exchange}`;
+    const prev = lastAlertProfit.get(key);
+    const isNew = prev === undefined;
+    const meaningfulChange =
+      !isNew && Math.abs(op.netProfit - prev) / Math.max(prev, 1) > 0.05;
+    if (isNew || meaningfulChange) {
+      lastAlertProfit.set(key, op.netProfit);
+      const alert = { ...op, key, t: Date.now() };
+      recentAlerts.unshift(alert);
+      if (recentAlerts.length > ALERT_HISTORY_MAX) recentAlerts.length = ALERT_HISTORY_MAX;
+      auditBus.emit("alert", alert);
+    }
+  }
+  // expire keys whose route is no longer above threshold so re-entry re-alerts
+  const liveKeys = new Set(profitable.map((o) => `${o.buy.exchange}>${o.sell.exchange}`));
+  for (const k of [...lastAlertProfit.keys()]) {
+    if (!liveKeys.has(k)) lastAlertProfit.delete(k);
+  }
 }
 
 function downsample(arr, max) {
@@ -247,6 +307,169 @@ app.post("/api/:exchange/update-ad", withAdapter, async (req, res) => {
       raw: body,
     });
   }
+});
+
+const WITHDRAWAL_FEES = {
+  binance: { TRC20: 1, BEP20: 0.29, SOL: 1, TON: 0.8, ARB: 0.1 },
+  bybit:   { TRC20: 1, BEP20: 0.5,  SOL: 1, TON: 0.1, ARB: 0.1 },
+  okx:     { TRC20: 1, BEP20: 0.8,  SOL: 1, TON: 0.2 },
+  mexc:    { TRC20: 1, BEP20: 1,    SOL: 1, TON: 0.5 },
+  kucoin:  { TRC20: 1, BEP20: 0.5,  SOL: 1, TON: 0.2 },
+};
+
+function pickBestNetwork(fromId, toId) {
+  if (fromId === toId) return { network: null, fee: 0 };
+  const fromFees = WITHDRAWAL_FEES[fromId];
+  const toFees = WITHDRAWAL_FEES[toId];
+  if (!fromFees || !toFees) return { network: null, fee: 1 };
+  let best = null;
+  for (const net of Object.keys(fromFees)) {
+    if (toFees[net] === undefined) continue;
+    if (!best || fromFees[net] < best.fee) best = { network: net, fee: fromFees[net] };
+  }
+  return best || { network: null, fee: 1 };
+}
+
+function computeAudit({ amount = 1000, feeOverride = null }) {
+  const adapters = listAdapters().map((m) => getAdapter(m.id));
+  const snapshots = adapters.map((adapter) => {
+    const s = getState(adapter.id);
+    if (!s.cache) return { id: adapter.id, label: adapter.label, error: "no data" };
+    return { id: adapter.id, label: adapter.label, data: s.cache.data, t: s.cache.t };
+  });
+
+  const exchanges = [];
+  for (const snap of snapshots) {
+    if (snap.error || !snap.data) {
+      exchanges.push({ id: snap.id, label: snap.label, error: snap.error || "no data" });
+      continue;
+    }
+    const fillsAmount = (order) => {
+      if (!order || !Number.isFinite(order.price) || order.price <= 0) return false;
+      const usdtMin = order.min / order.price;
+      const usdtMax = order.max / order.price;
+      return usdtMin <= amount && amount <= usdtMax;
+    };
+    const buyOrders = (snap.data.buy || []).filter(fillsAmount);
+    const sellOrders = (snap.data.sell || []).filter(fillsAmount);
+    const bestAsk = buyOrders[0] || null;
+    const bestBid = sellOrders[0] || null;
+    exchanges.push({
+      id: snap.id,
+      label: snap.label,
+      updatedAt: snap.t,
+      bestAsk,
+      bestBid,
+    });
+  }
+
+  const opportunities = [];
+  for (const buyEx of exchanges) {
+    if (!buyEx.bestAsk) continue;
+    for (const sellEx of exchanges) {
+      if (!sellEx.bestBid) continue;
+      const buyPrice = buyEx.bestAsk.price;
+      const sellPrice = sellEx.bestBid.price;
+      const route = pickBestNetwork(buyEx.id, sellEx.id);
+      const transferFee = feeOverride !== null ? feeOverride : route.fee;
+      const usdtAfterFee = amount - transferFee;
+      if (usdtAfterFee <= 0) continue;
+      const cost = amount * buyPrice;
+      const receive = usdtAfterFee * sellPrice;
+      const netProfit = receive - cost;
+      const profitPerUsdt = netProfit / amount;
+      const profitPercent = (netProfit / cost) * 100;
+      opportunities.push({
+        buy: {
+          exchange: buyEx.id,
+          label: buyEx.label,
+          price: buyPrice,
+          merchant: buyEx.bestAsk.merchant,
+          min: buyEx.bestAsk.min,
+          max: buyEx.bestAsk.max,
+        },
+        sell: {
+          exchange: sellEx.id,
+          label: sellEx.label,
+          price: sellPrice,
+          merchant: sellEx.bestBid.merchant,
+          min: sellEx.bestBid.min,
+          max: sellEx.bestBid.max,
+        },
+        sameExchange: buyEx.id === sellEx.id,
+        network: route.network,
+        amount,
+        transferFee,
+        cost,
+        receive,
+        netProfit,
+        profitPerUsdt,
+        profitPercent,
+      });
+    }
+  }
+
+  opportunities.sort((a, b) => b.netProfit - a.netProfit);
+
+  return {
+    amount,
+    feeOverride,
+    exchanges,
+    opportunities,
+    generatedAt: Date.now(),
+  };
+}
+
+app.get("/api/audit", (req, res) => {
+  const amount = Math.max(1000, Number(req.query.amount) || 1000);
+  const feeOverride =
+    req.query.fee === undefined ? null : Math.max(0, Number(req.query.fee));
+  liveSettings.amount = amount;
+  liveSettings.feeOverride = feeOverride;
+  if (req.query.threshold !== undefined) {
+    liveSettings.threshold = Math.max(0, Number(req.query.threshold) || 0);
+  }
+  res.json(computeAudit({ amount, feeOverride }));
+});
+
+app.get("/api/audit/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  send("hello", { recentAlerts, settings: liveSettings });
+  send("snapshot", computeAudit(liveSettings));
+
+  const onSnapshot = (audit) => send("snapshot", audit);
+  const onAlert = (alert) => send("alert", alert);
+  auditBus.on("snapshot", onSnapshot);
+  auditBus.on("alert", onAlert);
+
+  const ka = setInterval(() => res.write(": ka\n\n"), 25_000);
+
+  req.on("close", () => {
+    clearInterval(ka);
+    auditBus.off("snapshot", onSnapshot);
+    auditBus.off("alert", onAlert);
+  });
+});
+
+app.post("/api/audit/settings", (req, res) => {
+  const { amount, fee, threshold } = req.body || {};
+  if (amount !== undefined) liveSettings.amount = Math.max(1000, Number(amount) || 1000);
+  if (fee !== undefined)
+    liveSettings.feeOverride = fee === null ? null : Math.max(0, Number(fee));
+  if (threshold !== undefined)
+    liveSettings.threshold = Math.max(0, Number(threshold) || 0);
+  lastAlertProfit.clear();
+  res.json({ ok: true, settings: liveSettings });
 });
 
 app.get("/api/p2p", (req, res) => res.redirect(307, "/api/binance/p2p"));
