@@ -3,7 +3,7 @@ const { sanitizeOrders } = require("./util");
 
 const SEARCH_URL = "https://api2.bybit.com/fiat/otc/item/online";
 
-const SIDE_FOR = { BUY: "0", SELL: "1" };
+const SIDE_FOR = { BUY: "1", SELL: "0" };
 
 async function fetchP2P({ tradeType, asset = "USDT", fiat = "AMD" }) {
   const side = SIDE_FOR[tradeType];

@@ -63,7 +63,12 @@
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('side=0 prices:', [i['price'] for i in d['result']['items'][:3]]\\)\")",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('side=1 prices:', [i['price'] for i in d['result']['items'][:3]]\\)\")",
       "Bash(node *)",
-      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(list\\(d['items'][0].keys\\(\\)\\)\\)\")"
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(list\\(d['items'][0].keys\\(\\)\\)\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); items=d.get\\('result',{}\\).get\\('items',[]\\); print\\('side=0:'\\); [print\\(f\\\\\"  {i['price']} - {i['nickName']}\\\\\"\\) for i in items]\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); items=d.get\\('result',{}\\).get\\('items',[]\\); print\\('side=1:'\\); [print\\(f\\\\\"  {i['price']} - {i['nickName']}\\\\\"\\) for i in items]\")",
+      "Bash(git -C /Users/hrak/Desktop/p2p-bot log --all --oneline -- backend/adapters/bybit.js)",
+      "Bash(git -C /Users/hrak/Desktop/p2p-bot diff HEAD -- backend/adapters/bybit.js)",
+      "Bash(git -C /Users/hrak/Desktop/p2p-bot show HEAD:backend/adapters/bybit.js)"
     ]
   }
 }
