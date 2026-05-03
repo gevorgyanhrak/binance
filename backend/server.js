@@ -200,57 +200,70 @@ function checkDrift(exchangeId) {
   const now = Date.now();
   applied.lastDrift = applied.lastDrift || {};
 
-  const sides = [];
-  if (applied.buy) {
-    const currentRank = rankForBid(sellOrders, applied.buy.price);
-    if (currentRank > applied.buy.targetRank) {
-      sides.push({
+  const events = [];
+  const isMeaningful = (current, suggested) =>
+    suggested != null &&
+    Number.isFinite(suggested) &&
+    Math.abs(suggested - current) >= PRICE_STEP / 2;
+
+  for (const ad of applied.buyAds || []) {
+    const currentRank = rankForBid(sellOrders, ad.price);
+    if (currentRank > ad.targetRank) {
+      const suggestedPrice = suggestedBuyAdPrice(
+        sellOrders,
+        ad.targetRank,
+        ad.minProfit,
+        (applied.sellAds || [])[0]?.price
+      );
+      if (!isMeaningful(ad.price, suggestedPrice)) continue;
+      events.push({
         side: "buy",
-        adNo: applied.buy.adNo,
-        currentPrice: applied.buy.price,
+        adNo: ad.adNo,
+        currentPrice: ad.price,
         currentRank,
-        targetRank: applied.buy.targetRank,
-        suggestedPrice: suggestedBuyAdPrice(
-          sellOrders,
-          applied.buy.targetRank,
-          applied.buy.minProfit,
-          applied.sell?.price
-        ),
+        targetRank: ad.targetRank,
+        suggestedPrice,
       });
     }
   }
-  if (applied.sell) {
-    const currentRank = rankForAsk(buyOrders, applied.sell.price);
-    if (currentRank > applied.sell.targetRank) {
-      sides.push({
+  for (const ad of applied.sellAds || []) {
+    const currentRank = rankForAsk(buyOrders, ad.price);
+    if (currentRank > ad.targetRank) {
+      const suggestedPrice = suggestedSellAdPrice(
+        buyOrders,
+        ad.targetRank,
+        ad.minProfit,
+        (applied.buyAds || [])[0]?.price
+      );
+      if (!isMeaningful(ad.price, suggestedPrice)) continue;
+      events.push({
         side: "sell",
-        adNo: applied.sell.adNo,
-        currentPrice: applied.sell.price,
+        adNo: ad.adNo,
+        currentPrice: ad.price,
         currentRank,
-        targetRank: applied.sell.targetRank,
-        suggestedPrice: suggestedSellAdPrice(
-          buyOrders,
-          applied.sell.targetRank,
-          applied.sell.minProfit,
-          applied.buy?.price
-        ),
+        targetRank: ad.targetRank,
+        suggestedPrice,
       });
     }
   }
 
-  for (const ev of sides) {
-    const last = applied.lastDrift[ev.side];
+  for (const ev of events) {
+    const key = `${ev.side}:${ev.adNo}`;
+    const last = applied.lastDrift[key];
     const stale = !last || now - last.t > DRIFT_REPEAT_MS;
     const rankChanged = !last || last.rank !== ev.currentRank;
     if (stale || rankChanged) {
-      applied.lastDrift[ev.side] = { t: now, rank: ev.currentRank };
-      getDriftBus(exchangeId).emit("drift", { exchange: exchangeId, t: now, ...ev });
+      applied.lastDrift[key] = { t: now, rank: ev.currentRank };
+      getDriftBus(exchangeId).emit("drift", {
+        exchange: exchangeId,
+        t: now,
+        ...ev,
+      });
     }
   }
-  // clear lastDrift for sides no longer drifting
-  const driftingSides = new Set(sides.map((s) => s.side));
+  const driftingKeys = new Set(events.map((e) => `${e.side}:${e.adNo}`));
   for (const k of Object.keys(applied.lastDrift)) {
-    if (!driftingSides.has(k)) delete applied.lastDrift[k];
+    if (!driftingKeys.has(k)) delete applied.lastDrift[k];
   }
 }
 
@@ -437,7 +450,7 @@ app.post("/api/:exchange/balance", withAdapter, async (req, res) => {
 
 app.post("/api/:exchange/applied", withAdapter, (req, res) => {
   const id = req.adapter.id;
-  const { buy, sell, clear } = req.body || {};
+  const { buy, sell, buyAds, sellAds, clear } = req.body || {};
   if (clear) {
     delete appliedAds[id];
     return res.json({ ok: true, applied: null });
@@ -454,12 +467,20 @@ app.post("/api/:exchange/applied", withAdapter, (req, res) => {
       appliedAt: Date.now(),
     };
   };
-  const next = { buy: norm(buy), sell: norm(sell), lastDrift: {} };
-  if (!next.buy && !next.sell) {
+  const buyArr = Array.isArray(buyAds)
+    ? buyAds.map(norm).filter(Boolean)
+    : buy
+      ? [norm(buy)].filter(Boolean)
+      : [];
+  const sellArr = Array.isArray(sellAds)
+    ? sellAds.map(norm).filter(Boolean)
+    : sell
+      ? [norm(sell)].filter(Boolean)
+      : [];
+  if (buyArr.length === 0 && sellArr.length === 0) {
     return res.status(400).json({ ok: false, error: "buy or sell required" });
   }
-  appliedAds[id] = next;
-  // immediately re-evaluate so a fresh apply that's already drifted fires right away
+  appliedAds[id] = { buyAds: buyArr, sellAds: sellArr, lastDrift: {} };
   checkDrift(id);
   res.json({ ok: true, applied: appliedAds[id] });
 });
@@ -508,10 +529,17 @@ app.post("/api/:exchange/update-ad", withAdapter, async (req, res) => {
   }
   try {
     const data = await adapter.updateAd({ apiKey, apiSecret, adNo, price });
+    console.log(`[${adapter.id}] update-ad ok adNo=${adNo} price=${price}`, JSON.stringify(data));
     res.json({ ok: true, data });
   } catch (err) {
     const status = err.response?.status || 500;
     const body = err.response?.data;
+    console.error(
+      `[${adapter.id}] update-ad FAIL adNo=${adNo} price=${price}`,
+      "status=", status,
+      "body=", JSON.stringify(body),
+      "headers=", JSON.stringify(err.response?.headers || {})
+    );
     res.status(status).json({
       ok: false,
       error: body?.msg || body?.message || err.message || "Adapter error",

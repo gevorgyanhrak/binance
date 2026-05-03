@@ -81,6 +81,7 @@ async function getBalance({ apiKey, apiSecret, asset = "USDT" }) {
 async function updateAd({ apiKey, apiSecret, adNo, price }) {
   const params = {
     adsNo: adNo,
+    priceType: 1,
     price: String(price),
     timestamp: Date.now(),
     recvWindow: 5000,
