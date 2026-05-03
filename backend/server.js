@@ -2,12 +2,16 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 const { EventEmitter } = require("events");
 const { getAdapter, listAdapters } = require("./adapters");
+const riskRouter = require("./risk/routes");
+const dbApi = require("./db");
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "64kb" }));
+app.use("/api", riskRouter);
 
 const REFRESH_INTERVAL_MS = 30_000;
 const LIVE_REFRESH_INTERVAL_MS = 3_000;
@@ -129,14 +133,66 @@ for (const meta of listAdapters()) {
   setInterval(() => refresh(adapter), REFRESH_INTERVAL_MS);
 }
 
-const liveSettings = {
-  amount: 100,
-  minProfitPerUsdt: 3,
-};
+const liveSettings = Object.assign(
+  { amount: 100, minProfitPerUsdt: 3 },
+  dbApi.kvGet("liveSettings", {})
+);
+
+const telegramSettings = Object.assign(
+  { botToken: "", chatId: "", alerts: true, drift: true, newOrders: true },
+  dbApi.kvGet("telegramSettings", {})
+);
+
+const orderWatcher = Object.assign(
+  { apiKey: "", apiSecret: "", lastPoll: 0 },
+  dbApi.kvGet("orderWatcher", {}),
+  { seenOrderIds: new Set(dbApi.kvGet("orderWatcherSeen", [])) }
+);
+
+function persistLive() {
+  dbApi.kvSet("liveSettings", {
+    amount: liveSettings.amount,
+    minProfitPerUsdt: liveSettings.minProfitPerUsdt,
+  });
+}
+function persistTelegram() {
+  dbApi.kvSet("telegramSettings", { ...telegramSettings });
+}
+function persistOrderWatcher() {
+  dbApi.kvSet("orderWatcher", {
+    apiKey: orderWatcher.apiKey,
+    apiSecret: orderWatcher.apiSecret,
+    lastPoll: orderWatcher.lastPoll,
+  });
+  dbApi.kvSet("orderWatcherSeen", [...orderWatcher.seenOrderIds].slice(-3000));
+}
+
+async function sendTelegram(text) {
+  if (!telegramSettings.botToken || !telegramSettings.chatId) return;
+  try {
+    const url = `https://api.telegram.org/bot${telegramSettings.botToken}/sendMessage`;
+    await axios.post(
+      url,
+      {
+        chat_id: telegramSettings.chatId,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      },
+      { timeout: 8000 }
+    );
+  } catch (err) {
+    console.error("[telegram] send failed:", err.response?.data?.description || err.message);
+  }
+}
 
 const PRICE_STEP = 0.01;
 const DRIFT_REPEAT_MS = 5 * 60 * 1000;
-const appliedAds = {};
+const appliedAds = dbApi.kvGet("appliedAds", {});
+// scrub any stale lastDrift state from previous run so banners re-evaluate cleanly
+for (const id of Object.keys(appliedAds)) {
+  appliedAds[id].lastDrift = {};
+}
 const driftBuses = {};
 
 function getDriftBus(id) {
@@ -259,6 +315,16 @@ function checkDrift(exchangeId) {
         t: now,
         ...ev,
       });
+      if (telegramSettings.drift) {
+        sendTelegram(
+          `<b>⚠️ Drift on ${exchangeId}</b>\n` +
+            `${ev.side.toUpperCase()} ad ${ev.adNo} dropped to rank #${ev.currentRank} (target #${ev.targetRank}).\n` +
+            `Current price: ${ev.currentPrice}\n` +
+            (ev.suggestedPrice != null
+              ? `Suggested: <b>${ev.suggestedPrice}</b>`
+              : "")
+        );
+      }
     }
   }
   const driftingKeys = new Set(events.map((e) => `${e.side}:${e.adNo}`));
@@ -306,6 +372,21 @@ function detectAlerts(audit) {
       recentAlerts.unshift(alert);
       if (recentAlerts.length > ALERT_HISTORY_MAX) recentAlerts.length = ALERT_HISTORY_MAX;
       auditBus.emit("alert", alert);
+      if (telegramSettings.alerts) {
+        const fmt = (n) =>
+          Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+        const fmt2 = (n) =>
+          Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const route = op.sameExchange
+          ? `${op.buy.label} (intra)`
+          : `${op.buy.label} → ${op.sell.label}${op.network ? ` via ${op.network}` : ""}`;
+        sendTelegram(
+          `<b>💰 Live alert</b>\n` +
+            `${route}\n` +
+            `Buy ${fmt2(op.buy.price)} (${op.buy.merchant}) → Sell ${fmt2(op.sell.price)} (${op.sell.merchant})\n` +
+            `Net <b>+${fmt(op.netProfit)} AMD</b> on ${fmt(op.amount)} USDT (${op.profitPerUsdt.toFixed(2)} AMD/USDT, ${op.profitPercent.toFixed(2)}%)`
+        );
+      }
     }
   }
   // expire keys whose route is no longer above threshold so re-entry re-alerts
@@ -329,6 +410,319 @@ function downsample(arr, max) {
 
 app.get("/api/exchanges", (req, res) => {
   res.json({ exchanges: listAdapters() });
+});
+
+function findAdByMerchant(exchangeId, usernameLower) {
+  const s = state[exchangeId];
+  if (!s?.cache?.data) return null;
+  const lists = [s.cache.data.buy || [], s.cache.data.sell || []];
+  for (const ads of lists) {
+    for (const ad of ads) {
+      if (ad.merchant && ad.merchant.toLowerCase() === usernameLower) {
+        return ad;
+      }
+    }
+  }
+  return null;
+}
+
+function extractStatsFromAd(ad) {
+  const t = ad.trader || {};
+  const monthOrderCount =
+    t.monthOrderCount ?? t.recentOrderCount ?? null;
+  const monthFinishRate =
+    t.monthFinishRate != null
+      ? Number(t.monthFinishRate)
+      : t.completionRate != null
+      ? Number(t.completionRate) / 100
+      : null;
+  const positiveRate = t.positiveRate != null ? Number(t.positiveRate) : null;
+  const orderCount = t.orderCount ?? t.finishCount ?? monthOrderCount ?? null;
+  const totalOrders = orderCount;
+  let successfulOrders = null;
+  let cancelledOrders = null;
+  if (Number.isFinite(totalOrders) && Number.isFinite(monthFinishRate)) {
+    successfulOrders = Math.round(totalOrders * monthFinishRate);
+    cancelledOrders = totalOrders - successfulOrders;
+  } else if (Number.isFinite(t.finishCount) && Number.isFinite(orderCount)) {
+    successfulOrders = t.finishCount;
+    cancelledOrders = orderCount - t.finishCount;
+  }
+  let stars = null;
+  if (positiveRate != null) stars = Number((positiveRate * 5).toFixed(2));
+  return {
+    totalOrders,
+    successfulOrders,
+    cancelledOrders,
+    positiveFeedback: null,
+    negativeFeedback: null,
+    stars,
+  };
+}
+
+function resolveCounterpartyName(order, exchangeId) {
+  const masked =
+    order.counterPartNickName ||
+    order.makerNickname ||
+    order.takerNickname ||
+    null;
+  const userNo =
+    order.counterPartUserNo ||
+    order.advertiserNo ||
+    order.makerUserNo ||
+    order.takerUserNo ||
+    null;
+  const s = state[exchangeId];
+  const ads = s?.cache?.data
+    ? [...(s.cache.data.buy || []), ...(s.cache.data.sell || [])]
+    : [];
+  if (userNo) {
+    const byNo = ads.find((ad) => ad.trader?.userId === userNo);
+    if (byNo?.merchant) return { name: byNo.merchant, full: true };
+  }
+  if (masked && masked.includes("*")) {
+    const prefix = masked.replace(/\*+$/, "").trim();
+    if (prefix.length >= 2) {
+      const lower = prefix.toLowerCase();
+      const matches = ads.filter(
+        (ad) => ad.merchant && ad.merchant.toLowerCase().startsWith(lower)
+      );
+      const unique = Array.from(
+        new Map(matches.map((m) => [m.merchant, m])).values()
+      );
+      if (unique.length === 1) return { name: unique[0].merchant, full: true };
+    }
+  }
+  return { name: masked || "(unknown)", full: !masked || !masked.includes("*") };
+}
+
+const { getRecord: riskGetRecord, computeVerdict: riskComputeVerdict } =
+  require("./risk/reputation");
+
+app.post("/api/risk/my-orders", async (req, res) => {
+  const {
+    exchange = "binance",
+    apiKey,
+    apiSecret,
+    days = 30,
+  } = req.body || {};
+  if (!apiKey || !apiSecret) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "apiKey and apiSecret required" });
+  }
+  const adapter = getAdapter(exchange);
+  if (!adapter?.getOrders) {
+    return res.status(501).json({
+      ok: false,
+      error: `${exchange} does not support order history`,
+    });
+  }
+  const period = Math.max(1, Math.min(90, Number(days) || 30));
+  const end = Date.now();
+  const start = end - period * 86400000;
+  const allOrders = [];
+  try {
+    for (const side of ["BUY", "SELL"]) {
+      let page = 1;
+      while (page <= 10) {
+        const r = await adapter.getOrders({
+          apiKey,
+          apiSecret,
+          startTimestamp: start,
+          endTimestamp: end,
+          page,
+          rows: 100,
+          tradeType: side,
+        });
+        const rows = r?.data || [];
+        if (!rows.length) break;
+        for (const o of rows) allOrders.push({ ...o, _side: side });
+        if (rows.length < 100) break;
+        page++;
+      }
+    }
+  } catch (err) {
+    return res.status(err.response?.status || 500).json({
+      ok: false,
+      error:
+        err.response?.data?.msg ||
+        err.response?.data?.message ||
+        err.message,
+    });
+  }
+
+  const byUser = new Map();
+  for (const o of allOrders) {
+    const resolved = resolveCounterpartyName(o, exchange);
+    const display = resolved.name;
+    if (!display || display === "(unknown)") continue;
+    const key = display.toLowerCase();
+    let agg = byUser.get(key);
+    if (!agg) {
+      agg = {
+        username: key,
+        displayName: display,
+        nameFull: resolved.full,
+        total: 0,
+        completed: 0,
+        cancelled: 0,
+        appealed: 0,
+        totalUsdt: 0,
+        lastTradeAt: 0,
+        sides: { BUY: 0, SELL: 0 },
+      };
+      byUser.set(key, agg);
+    } else if (resolved.full && !agg.nameFull) {
+      agg.displayName = display;
+      agg.nameFull = true;
+    }
+    agg.total++;
+    agg.sides[o._side] = (agg.sides[o._side] || 0) + 1;
+    const status = String(o.orderStatus || "").toUpperCase();
+    if (status === "COMPLETED" || status === "RELEASED") agg.completed++;
+    if (status.includes("CANCEL")) agg.cancelled++;
+    if (status.includes("APPEAL") || status.includes("DISPUTE")) agg.appealed++;
+    agg.totalUsdt += parseFloat(o.amount) || 0;
+    const t = Number(o.createTime || o.orderCreateTime || 0);
+    if (t > agg.lastTradeAt) agg.lastTradeAt = t;
+  }
+
+  const ordersByUser = new Map();
+  for (const o of allOrders) {
+    const masked =
+      o.counterPartNickName || o.makerNickname || o.takerNickname || "";
+    const resolved = resolveCounterpartyName(o, exchange);
+    const key = resolved.name.toLowerCase();
+    if (!ordersByUser.has(key)) ordersByUser.set(key, []);
+    ordersByUser.get(key).push({ orderNumber: o.orderNumber, masked });
+  }
+
+  if (adapter.getOrderDetail) {
+    const stillMasked = [...byUser.values()].filter(
+      (a) => !a.nameFull && a.displayName && a.displayName.includes("*")
+    );
+    const MAX_DETAIL_CALLS = 30;
+    const targets = stillMasked.slice(0, MAX_DETAIL_CALLS);
+    await Promise.all(
+      targets.map(async (agg) => {
+        const list = ordersByUser.get(agg.username) || [];
+        const sample = list.find((x) => x.orderNumber);
+        if (!sample) return;
+        try {
+          const d = await adapter.getOrderDetail({
+            apiKey,
+            apiSecret,
+            orderNumber: sample.orderNumber,
+          });
+          const data = d?.data || {};
+          const candidates = [
+            data.makerNickname,
+            data.takerNickname,
+            data.counterPartNickName,
+            data.nickName,
+            data.advertiser?.nickName,
+            data.customer?.nickName,
+          ].filter(Boolean);
+          const fullName = candidates.find(
+            (c) => typeof c === "string" && !c.includes("*")
+          );
+          if (fullName) {
+            const newKey = fullName.toLowerCase();
+            const existing = byUser.get(newKey);
+            if (existing && existing !== agg) {
+              existing.total += agg.total;
+              existing.completed += agg.completed;
+              existing.cancelled += agg.cancelled;
+              existing.appealed += agg.appealed;
+              existing.totalUsdt += agg.totalUsdt;
+              existing.sides.BUY += agg.sides.BUY || 0;
+              existing.sides.SELL += agg.sides.SELL || 0;
+              if (agg.lastTradeAt > existing.lastTradeAt)
+                existing.lastTradeAt = agg.lastTradeAt;
+              byUser.delete(agg.username);
+            } else {
+              byUser.delete(agg.username);
+              agg.username = newKey;
+              agg.displayName = fullName;
+              agg.nameFull = true;
+              byUser.set(newKey, agg);
+            }
+          }
+        } catch {
+          /* ignore individual failures */
+        }
+      })
+    );
+  }
+
+  const counterparties = [];
+  for (const [, agg] of byUser) {
+    const record = riskGetRecord(agg.username);
+    const verdict = riskComputeVerdict(record);
+    const cancelRate = agg.total > 0 ? agg.cancelled / agg.total : 0;
+    const stopTrading =
+      verdict.verdict === "bad" ||
+      record?.manualRating === "bad" ||
+      agg.appealed > 0 ||
+      (cancelRate >= 0.3 && agg.total >= 3);
+    counterparties.push({
+      ...agg,
+      verdict: verdict.verdict,
+      score: verdict.score,
+      reasons: verdict.reasons,
+      manualRating: record?.manualRating || null,
+      stopTrading,
+      cancelRate,
+    });
+  }
+
+  const order = { bad: 0, neutral: 1, unknown: 2, good: 3 };
+  counterparties.sort((a, b) => {
+    const va = order[a.verdict] ?? 4;
+    const vb = order[b.verdict] ?? 4;
+    if (va !== vb) return va - vb;
+    if (a.cancelRate !== b.cancelRate) return b.cancelRate - a.cancelRate;
+    return b.total - a.total;
+  });
+
+  res.json({
+    ok: true,
+    exchange,
+    days: period,
+    totalOrders: allOrders.length,
+    uniqueCounterparties: counterparties.length,
+    counterparties,
+    flagged: counterparties.filter((c) => c.stopTrading).length,
+  });
+});
+
+app.get("/api/risk/autofill", (req, res) => {
+  const username = String(req.query.username || "").trim();
+  if (!username) {
+    return res.status(400).json({ ok: false, error: "username required" });
+  }
+  const lower = username.toLowerCase();
+  for (const meta of listAdapters()) {
+    const ad = findAdByMerchant(meta.id, lower);
+    if (ad) {
+      return res.json({
+        ok: true,
+        found: true,
+        username,
+        exchange: meta.id,
+        exchangeLabel: meta.label,
+        merchant: ad.merchant,
+        stats: extractStatsFromAd(ad),
+        trader: ad.trader || null,
+      });
+    }
+  }
+  res.status(404).json({
+    ok: false,
+    found: false,
+    error: "User not currently in any cached order book",
+  });
 });
 
 function withAdapter(req, res, next) {
@@ -423,6 +817,68 @@ app.get("/api/:exchange/history", withAdapter, (req, res) => {
   });
 });
 
+app.get("/api/:exchange/orders/cached", withAdapter, (req, res) => {
+  const id = req.adapter.id;
+  const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+  const end = Date.now();
+  const start = end - days * 24 * 60 * 60 * 1000;
+  const rows = dbApi.listOrders(id, start, end, 5000);
+  res.json({
+    ok: true,
+    count: rows.length,
+    orders: rows.map((r) => ({
+      orderNumber: r.order_no,
+      tradeType: r.trade_type,
+      asset: r.asset,
+      fiat: r.fiat,
+      amount: r.amount,
+      unitPrice: r.unit_price,
+      totalPrice: r.total_price,
+      counterPartNickName: r.counterparty,
+      orderStatus: r.status,
+      createTime: r.create_time,
+    })),
+  });
+});
+
+app.post("/api/:exchange/orders", withAdapter, async (req, res) => {
+  const adapter = req.adapter;
+  if (!adapter.getOrders) {
+    return res
+      .status(501)
+      .json({ ok: false, error: `getOrders not implemented for ${adapter.id}` });
+  }
+  const { apiKey, apiSecret, startTimestamp, endTimestamp, page, rows, tradeType } = req.body || {};
+  if (!apiKey || !apiSecret) {
+    return res.status(400).json({ ok: false, error: "Missing apiKey or apiSecret" });
+  }
+  try {
+    const data = await adapter.getOrders({
+      apiKey,
+      apiSecret,
+      startTimestamp,
+      endTimestamp,
+      page,
+      rows,
+      tradeType,
+    });
+    try {
+      dbApi.saveOrders(adapter.id, data?.data || []);
+    } catch (e) {
+      console.error(`[${adapter.id}] orders db save failed:`, e.message);
+    }
+    res.json({ ok: true, data });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const body = err.response?.data;
+    res.status(status).json({
+      ok: false,
+      error: body?.msg || body?.message || err.message || "Adapter error",
+      code: body?.code,
+    });
+  }
+});
+
 app.post("/api/:exchange/balance", withAdapter, async (req, res) => {
   const adapter = req.adapter;
   if (!adapter.getBalance) {
@@ -453,6 +909,7 @@ app.post("/api/:exchange/applied", withAdapter, (req, res) => {
   const { buy, sell, buyAds, sellAds, clear } = req.body || {};
   if (clear) {
     delete appliedAds[id];
+    dbApi.kvSet("appliedAds", appliedAds);
     return res.json({ ok: true, applied: null });
   }
   const norm = (raw) => {
@@ -481,6 +938,7 @@ app.post("/api/:exchange/applied", withAdapter, (req, res) => {
     return res.status(400).json({ ok: false, error: "buy or sell required" });
   }
   appliedAds[id] = { buyAds: buyArr, sellAds: sellArr, lastDrift: {} };
+  dbApi.kvSet("appliedAds", appliedAds);
   checkDrift(id);
   res.json({ ok: true, applied: appliedAds[id] });
 });
@@ -697,6 +1155,7 @@ app.get("/api/audit", (req, res) => {
     const v = Number(req.query.minProfit);
     if (Number.isFinite(v)) liveSettings.minProfitPerUsdt = v;
   }
+  persistLive();
   res.json(computeAudit({ amount, feeOverride: null }));
 });
 
@@ -730,6 +1189,134 @@ app.get("/api/audit/stream", (req, res) => {
   });
 });
 
+app.get("/api/telegram/settings", (req, res) => {
+  res.json({
+    botToken: telegramSettings.botToken
+      ? `${telegramSettings.botToken.slice(0, 6)}…${telegramSettings.botToken.slice(-4)}`
+      : "",
+    chatId: telegramSettings.chatId,
+    alerts: telegramSettings.alerts,
+    drift: telegramSettings.drift,
+    newOrders: telegramSettings.newOrders,
+    configured: !!(telegramSettings.botToken && telegramSettings.chatId),
+  });
+});
+
+app.post("/api/telegram/settings", (req, res) => {
+  const { botToken, chatId, alerts, drift, newOrders } = req.body || {};
+  if (botToken !== undefined) telegramSettings.botToken = String(botToken || "").trim();
+  if (chatId !== undefined) telegramSettings.chatId = String(chatId || "").trim();
+  if (alerts !== undefined) telegramSettings.alerts = !!alerts;
+  if (drift !== undefined) telegramSettings.drift = !!drift;
+  if (newOrders !== undefined) telegramSettings.newOrders = !!newOrders;
+  persistTelegram();
+  res.json({ ok: true });
+});
+
+app.post("/api/telegram/watch-orders", (req, res) => {
+  const { apiKey, apiSecret, clear } = req.body || {};
+  if (clear) {
+    orderWatcher.apiKey = "";
+    orderWatcher.apiSecret = "";
+    orderWatcher.seenOrderIds.clear();
+    persistOrderWatcher();
+    return res.json({ ok: true, watching: false });
+  }
+  if (!apiKey || !apiSecret) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing apiKey or apiSecret" });
+  }
+  orderWatcher.apiKey = apiKey;
+  orderWatcher.apiSecret = apiSecret;
+  persistOrderWatcher();
+  // pre-seed seen IDs from the last 24h so historical orders don't all alert
+  pollOrdersForTelegram(true).catch(() => {});
+  res.json({ ok: true, watching: true });
+});
+
+async function pollOrdersForTelegram(seedOnly = false) {
+  if (!orderWatcher.apiKey || !orderWatcher.apiSecret) return;
+  if (!telegramSettings.botToken || !telegramSettings.chatId) return;
+  if (!telegramSettings.newOrders) return;
+  const adapter = getAdapter("binance");
+  if (!adapter?.getOrders) return;
+  const start = Date.now() - 24 * 60 * 60 * 1000;
+  const end = Date.now();
+  for (const tradeType of ["BUY", "SELL"]) {
+    try {
+      const data = await adapter.getOrders({
+        apiKey: orderWatcher.apiKey,
+        apiSecret: orderWatcher.apiSecret,
+        startTimestamp: start,
+        endTimestamp: end,
+        page: 1,
+        rows: 20,
+        tradeType,
+      });
+      const rows = data?.data || [];
+      try {
+        dbApi.saveOrders("binance", rows);
+      } catch (e) {
+        console.error("[order-watch] db save failed:", e.message);
+      }
+      for (const o of rows) {
+        const id = o.orderNumber;
+        if (!id) continue;
+        if (orderWatcher.seenOrderIds.has(id)) continue;
+        orderWatcher.seenOrderIds.add(id);
+        if (seedOnly) continue;
+        const status = (o.orderStatus || "").toUpperCase();
+        const isBuy = o.tradeType === "BUY";
+        sendTelegram(
+          `<b>🆕 New P2P ${isBuy ? "BUY" : "SELL"} order</b>\n` +
+            `Amount: ${o.amount} ${o.asset || "USDT"}\n` +
+            `Price: ${o.unitPrice} ${o.fiat || "AMD"}\n` +
+            `Total: ${o.totalPrice}\n` +
+            `Counterparty: ${o.counterPartNickName || "—"}\n` +
+            `Status: ${status}`
+        );
+      }
+    } catch (err) {
+      console.error("[order-watch]", tradeType, err.response?.data || err.message);
+    }
+  }
+  orderWatcher.lastPoll = Date.now();
+  // cap memory
+  if (orderWatcher.seenOrderIds.size > 5000) {
+    orderWatcher.seenOrderIds = new Set(
+      [...orderWatcher.seenOrderIds].slice(-3000)
+    );
+  }
+  persistOrderWatcher();
+}
+
+setInterval(() => pollOrdersForTelegram().catch(() => {}), 60_000);
+
+app.post("/api/telegram/test", async (req, res) => {
+  if (!telegramSettings.botToken || !telegramSettings.chatId) {
+    return res.status(400).json({ ok: false, error: "Bot token or chat ID missing" });
+  }
+  try {
+    const url = `https://api.telegram.org/bot${telegramSettings.botToken}/sendMessage`;
+    const r = await axios.post(
+      url,
+      {
+        chat_id: telegramSettings.chatId,
+        text: "✅ p2p-bot Telegram link OK — alerts will arrive here.",
+        parse_mode: "HTML",
+      },
+      { timeout: 8000 }
+    );
+    res.json({ ok: true, data: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      ok: false,
+      error: err.response?.data?.description || err.message,
+    });
+  }
+});
+
 app.post("/api/audit/settings", (req, res) => {
   const { amount, minProfit } = req.body || {};
   if (amount !== undefined) liveSettings.amount = Math.max(100, Number(amount) || 100);
@@ -738,6 +1325,7 @@ app.post("/api/audit/settings", (req, res) => {
     if (Number.isFinite(v)) liveSettings.minProfitPerUsdt = v;
   }
   lastAlertProfit.clear();
+  persistLive();
   res.json({ ok: true, settings: liveSettings });
 });
 

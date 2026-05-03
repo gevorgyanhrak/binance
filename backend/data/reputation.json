@@ -1,0 +1,122 @@
+{
+  "arart_crypto_exchang": {
+    "username": "arart_crypto_exchang",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 1500,
+      "successfulOrders": 1485,
+      "cancelledOrders": 15,
+      "positiveFeedback": 1400,
+      "negativeFeedback": 5,
+      "stars": 4.9
+    },
+    "exchange": "binance",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 1500,
+          "successfulOrders": 1485,
+          "cancelledOrders": 15,
+          "positiveFeedback": 1400,
+          "negativeFeedback": 5,
+          "stars": 4.9
+        },
+        "at": 1777832601906
+      }
+    ],
+    "createdAt": 1777832601906,
+    "updatedAt": 1777832601906
+  },
+  "user-46555": {
+    "username": "user-46555",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 49,
+      "successfulOrders": 49,
+      "cancelledOrders": 0,
+      "positiveFeedback": null,
+      "negativeFeedback": null,
+      "stars": 5
+    },
+    "exchange": "Binance",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 49,
+          "successfulOrders": 49,
+          "cancelledOrders": 0,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": 5
+        },
+        "at": 1777834726832
+      }
+    ],
+    "createdAt": 1777834726832,
+    "updatedAt": 1777834726832
+  },
+  "crypto_seraphim": {
+    "username": "crypto_seraphim",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 111,
+      "successfulOrders": 108,
+      "cancelledOrders": 3,
+      "positiveFeedback": null,
+      "negativeFeedback": null,
+      "stars": 5
+    },
+    "exchange": "Binance",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 111,
+          "successfulOrders": 108,
+          "cancelledOrders": 3,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": 5
+        },
+        "at": 1777834776505
+      }
+    ],
+    "createdAt": 1777834776505,
+    "updatedAt": 1777834776505
+  },
+  "royal91": {
+    "username": "royal91",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 1334,
+      "successfulOrders": 1334,
+      "cancelledOrders": 0,
+      "positiveFeedback": null,
+      "negativeFeedback": null,
+      "stars": 5
+    },
+    "exchange": "Binance",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 1334,
+          "successfulOrders": 1334,
+          "cancelledOrders": 0,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": 5
+        },
+        "at": 1777834946636
+      }
+    ],
+    "createdAt": 1777834946636,
+    "updatedAt": 1777834946636
+  }
+}

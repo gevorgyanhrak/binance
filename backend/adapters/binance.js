@@ -59,6 +59,40 @@ function signQuery(params, secret) {
   return `${query}&signature=${signature}`;
 }
 
+async function getOrderDetail({ apiKey, apiSecret, orderNumber }) {
+  const params = {
+    adOrderNo: orderNumber,
+    timestamp: Date.now(),
+    recvWindow: 5000,
+  };
+  const signedQuery = signQuery(params, apiSecret);
+  const url = `${API_BASE}/sapi/v1/c2c/orderMatch/getUserOrderDetail?${signedQuery}`;
+  const response = await axios.get(url, {
+    headers: { "X-MBX-APIKEY": apiKey },
+    timeout: 15000,
+  });
+  return response.data;
+}
+
+async function getOrders({ apiKey, apiSecret, startTimestamp, endTimestamp, page = 1, rows = 100, tradeType }) {
+  const params = {
+    page,
+    rows: Math.min(rows, 100),
+    timestamp: Date.now(),
+    recvWindow: 5000,
+  };
+  if (startTimestamp) params.startTimestamp = startTimestamp;
+  if (endTimestamp) params.endTimestamp = endTimestamp;
+  if (tradeType) params.tradeType = tradeType;
+  const signedQuery = signQuery(params, apiSecret);
+  const url = `${API_BASE}/sapi/v1/c2c/orderMatch/listUserOrderHistory?${signedQuery}`;
+  const response = await axios.get(url, {
+    headers: { "X-MBX-APIKEY": apiKey },
+    timeout: 15000,
+  });
+  return response.data;
+}
+
 async function getBalance({ apiKey, apiSecret, asset = "USDT" }) {
   const params = {
     timestamp: Date.now(),
@@ -101,4 +135,6 @@ module.exports = {
   fetchP2P,
   updateAd,
   getBalance,
+  getOrders,
+  getOrderDetail,
 };

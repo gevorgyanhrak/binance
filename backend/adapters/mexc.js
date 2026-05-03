@@ -26,12 +26,31 @@ async function fetchP2P({ tradeType, asset = "USDT", fiat = "AMD" }) {
   });
 
   const items = res.data?.data || [];
-  const orders = items.map((item) => ({
-    price: parseFloat(item.price),
-    min: parseFloat(item.minTradeLimit ?? 0),
-    max: parseFloat(item.maxTradeLimit ?? 0),
-    merchant: item.merchant?.nickName || "",
-  }));
+  const orders = items.map((item) => {
+    const ms = item.merchantStatistics || {};
+    const totalOrders =
+      (Number(ms.totalBuyCount) || 0) + (Number(ms.totalSellCount) || 0) ||
+      null;
+    return {
+      price: parseFloat(item.price),
+      min: parseFloat(item.minTradeLimit ?? 0),
+      max: parseFloat(item.maxTradeLimit ?? 0),
+      merchant: item.merchant?.nickName || "",
+      trader: {
+        userId: item.merchant?.uid,
+        nickname: item.merchant?.nickName,
+        kycLevel: item.kycLevel,
+        orderCount: totalOrders,
+        monthOrderCount: Number(ms.doneLastMonthCount) || null,
+        monthFinishRate:
+          ms.lastMonthCompleteRate != null
+            ? Number(ms.lastMonthCompleteRate)
+            : null,
+        positiveRate:
+          ms.completeRate != null ? Number(ms.completeRate) : null,
+      },
+    };
+  });
 
   const clean = sanitizeOrders(orders);
   clean.sort((a, b) =>

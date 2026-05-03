@@ -75,7 +75,14 @@
       "Bash(git -C /Users/hrak/Desktop/p2p-bot/frontend status src/pages/AuditDashboard.js)",
       "Bash(git rm *)",
       "Bash(sed -i '' 's|bg-accent text-\\\\[rgb\\(var\\(--c-bg\\)\\)\\\\]|bg-accent text-accent-fg|g' src/App.js src/pages/ExchangeDashboard.js)",
-      "Bash(sed -i '' 's|text-\\\\[rgb\\(var\\(--c-bg\\)\\)\\\\]|text-accent-fg|g' src/pages/ExchangeDashboard.js)"
+      "Bash(sed -i '' 's|text-\\\\[rgb\\(var\\(--c-bg\\)\\)\\\\]|text-accent-fg|g' src/pages/ExchangeDashboard.js)",
+      "Bash(lsof -iTCP:4000 -sTCP:LISTEN -P)",
+      "Bash(kill 38626 54517)",
+      "Bash(lsof -iTCP:4000 -P)",
+      "Bash(kill 53905)",
+      "Bash(node server.js)",
+      "Bash(echo \"started pid=$!\")",
+      "Bash(pkill -f \"node server.js\")"
     ]
   }
 }

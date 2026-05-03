@@ -1,1 +1,5 @@
 backend/history/*.json
+backend/data/p2p.db
+backend/data/p2p.db-journal
+backend/data/p2p.db-wal
+backend/data/p2p.db-shm
