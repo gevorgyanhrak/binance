@@ -34,6 +34,24 @@ async function fetchP2P({ tradeType, asset = "USDT", fiat = "AMD" }) {
     min: parseFloat(item.minAmount),
     max: parseFloat(item.maxAmount),
     merchant: item.nickName,
+    trader: {
+      userId: item.userId,
+      accountId: item.accountId,
+      nickname: item.nickName,
+      userType: item.userType,
+      orderCount: item.orderNum,
+      finishCount: item.finishNum,
+      recentOrderCount: item.recentOrderNum,
+      completionRate: item.recentExecuteRate,
+      paymentPeriodMin: item.paymentPeriod,
+      isOnline: item.isOnline,
+      remark: item.remark,
+      availableUsdt: parseFloat(item.lastQuantity || item.quantity || 0),
+      adNo: item.id,
+      profileUrl: item.userMaskId
+        ? `https://www.bybit.com/fiat/trade/otc/profile/${item.userMaskId}/USDT/${fiat}/buy`
+        : null,
+    },
   }));
 
   const clean = sanitizeOrders(orders);

@@ -15,12 +15,38 @@ async function fetchP2P({ tradeType, asset = "USDT", fiat = "AMD" }) {
     fiat,
     tradeType,
   });
-  const orders = res.data.data.map((item) => ({
-    price: parseFloat(item.adv.price),
-    min: parseFloat(item.adv.minSingleTransAmount),
-    max: parseFloat(item.adv.dynamicMaxSingleTransAmount),
-    merchant: item.advertiser.nickName,
-  }));
+  const orders = res.data.data.map((item) => {
+    const adv = item.adv || {};
+    const advertiser = item.advertiser || {};
+    const payments = (adv.tradeMethods || [])
+      .map((m) => m.tradeMethodName || m.identifier || m.payType)
+      .filter(Boolean);
+    return {
+      price: parseFloat(adv.price),
+      min: parseFloat(adv.minSingleTransAmount),
+      max: parseFloat(adv.dynamicMaxSingleTransAmount),
+      merchant: advertiser.nickName,
+      trader: {
+        userId: advertiser.userNo,
+        nickname: advertiser.nickName,
+        userType: advertiser.userType,
+        userGrade: advertiser.userGrade,
+        vipLevel: advertiser.vipLevel,
+        monthOrderCount: advertiser.monthOrderCount,
+        monthFinishRate: advertiser.monthFinishRate,
+        positiveRate: advertiser.positiveRate,
+        payTimeLimitMin: adv.payTimeLimit,
+        availableUsdt: parseFloat(
+          adv.dynamicMaxSingleTransQuantity || adv.tradableQuantity || 0
+        ),
+        paymentMethods: payments,
+        adNo: adv.advNo,
+        profileUrl: advertiser.userNo
+          ? `https://p2p.binance.com/en/advertiserDetail?advertiserNo=${advertiser.userNo}`
+          : null,
+      },
+    };
+  });
   return sanitizeOrders(orders);
 }
 
@@ -31,6 +57,25 @@ function signQuery(params, secret) {
     .update(query)
     .digest("hex");
   return `${query}&signature=${signature}`;
+}
+
+async function getBalance({ apiKey, apiSecret, asset = "USDT" }) {
+  const params = {
+    timestamp: Date.now(),
+    recvWindow: 5000,
+  };
+  const signedQuery = signQuery(params, apiSecret);
+  const url = `${API_BASE}/sapi/v3/asset/getUserAsset?${signedQuery}`;
+  const response = await axios.post(url, null, {
+    headers: { "X-MBX-APIKEY": apiKey },
+    timeout: 15000,
+  });
+  const rows = Array.isArray(response.data) ? response.data : [];
+  const row = rows.find((r) => r.asset === asset);
+  if (!row) return { asset, free: 0, locked: 0, total: 0 };
+  const free = parseFloat(row.free) || 0;
+  const locked = parseFloat(row.locked) || 0;
+  return { asset, free, locked, total: free + locked };
 }
 
 async function updateAd({ apiKey, apiSecret, adNo, price }) {
@@ -54,4 +99,5 @@ module.exports = {
   label: "Binance",
   fetchP2P,
   updateAd,
+  getBalance,
 };

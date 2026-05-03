@@ -14,8 +14,16 @@ const LIVE_REFRESH_INTERVAL_MS = 3_000;
 const auditBus = new EventEmitter();
 auditBus.setMaxListeners(50);
 const ALERT_HISTORY_MAX = 50;
+const ALERT_TTL_MS = 10 * 60 * 1000;
 const recentAlerts = [];
 const lastAlertProfit = new Map();
+
+function pruneRecentAlerts() {
+  const cutoff = Date.now() - ALERT_TTL_MS;
+  while (recentAlerts.length && recentAlerts[recentAlerts.length - 1].t < cutoff) {
+    recentAlerts.pop();
+  }
+}
 const RETENTION_MS = 31 * 24 * 60 * 60 * 1000;
 const HISTORY_DIR = path.join(__dirname, "history");
 if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
@@ -122,10 +130,129 @@ for (const meta of listAdapters()) {
 }
 
 const liveSettings = {
-  amount: 1000,
-  feeOverride: null,
-  threshold: 1000,
+  amount: 100,
+  minProfitPerUsdt: 3,
 };
+
+const PRICE_STEP = 0.01;
+const DRIFT_REPEAT_MS = 5 * 60 * 1000;
+const appliedAds = {};
+const driftBuses = {};
+
+function getDriftBus(id) {
+  if (!driftBuses[id]) {
+    const bus = new EventEmitter();
+    bus.setMaxListeners(50);
+    driftBuses[id] = bus;
+  }
+  return driftBuses[id];
+}
+
+function rankForBid(sellOrders, bidPrice) {
+  let ahead = 0;
+  for (const item of sellOrders) {
+    if (item.price > bidPrice) ahead++;
+    else break;
+  }
+  return ahead + 1;
+}
+
+function rankForAsk(buyOrders, askPrice) {
+  let ahead = 0;
+  for (const item of buyOrders) {
+    if (item.price < askPrice) ahead++;
+    else break;
+  }
+  return ahead + 1;
+}
+
+function suggestedBuyAdPrice(sellOrders, targetRank, minProfit, sellAdPrice) {
+  if (!sellOrders.length) return null;
+  const idx = Math.min(targetRank, sellOrders.length) - 1;
+  const target = sellOrders[idx];
+  if (!target) return null;
+  let price = Math.round((target.price + PRICE_STEP) * 100) / 100;
+  if (minProfit > 0 && Number.isFinite(sellAdPrice)) {
+    if (sellAdPrice - price < minProfit) price = Math.round((sellAdPrice - minProfit) * 100) / 100;
+  }
+  return price;
+}
+
+function suggestedSellAdPrice(buyOrders, targetRank, minProfit, buyAdPrice) {
+  if (!buyOrders.length) return null;
+  const idx = Math.min(targetRank, buyOrders.length) - 1;
+  const target = buyOrders[idx];
+  if (!target) return null;
+  let price = Math.round((target.price - PRICE_STEP) * 100) / 100;
+  if (minProfit > 0 && Number.isFinite(buyAdPrice)) {
+    if (price - buyAdPrice < minProfit) price = Math.round((buyAdPrice + minProfit) * 100) / 100;
+  }
+  return price;
+}
+
+function checkDrift(exchangeId) {
+  const applied = appliedAds[exchangeId];
+  if (!applied) return;
+  const cache = state[exchangeId]?.cache;
+  if (!cache?.data) return;
+  const buyOrders = cache.data.buy || [];
+  const sellOrders = cache.data.sell || [];
+  const now = Date.now();
+  applied.lastDrift = applied.lastDrift || {};
+
+  const sides = [];
+  if (applied.buy) {
+    const currentRank = rankForBid(sellOrders, applied.buy.price);
+    if (currentRank > applied.buy.targetRank) {
+      sides.push({
+        side: "buy",
+        adNo: applied.buy.adNo,
+        currentPrice: applied.buy.price,
+        currentRank,
+        targetRank: applied.buy.targetRank,
+        suggestedPrice: suggestedBuyAdPrice(
+          sellOrders,
+          applied.buy.targetRank,
+          applied.buy.minProfit,
+          applied.sell?.price
+        ),
+      });
+    }
+  }
+  if (applied.sell) {
+    const currentRank = rankForAsk(buyOrders, applied.sell.price);
+    if (currentRank > applied.sell.targetRank) {
+      sides.push({
+        side: "sell",
+        adNo: applied.sell.adNo,
+        currentPrice: applied.sell.price,
+        currentRank,
+        targetRank: applied.sell.targetRank,
+        suggestedPrice: suggestedSellAdPrice(
+          buyOrders,
+          applied.sell.targetRank,
+          applied.sell.minProfit,
+          applied.buy?.price
+        ),
+      });
+    }
+  }
+
+  for (const ev of sides) {
+    const last = applied.lastDrift[ev.side];
+    const stale = !last || now - last.t > DRIFT_REPEAT_MS;
+    const rankChanged = !last || last.rank !== ev.currentRank;
+    if (stale || rankChanged) {
+      applied.lastDrift[ev.side] = { t: now, rank: ev.currentRank };
+      getDriftBus(exchangeId).emit("drift", { exchange: exchangeId, t: now, ...ev });
+    }
+  }
+  // clear lastDrift for sides no longer drifting
+  const driftingSides = new Set(sides.map((s) => s.side));
+  for (const k of Object.keys(applied.lastDrift)) {
+    if (!driftingSides.has(k)) delete applied.lastDrift[k];
+  }
+}
 
 (function startLiveLoop() {
   const adapters = listAdapters().map((m) => getAdapter(m.id));
@@ -139,6 +266,7 @@ const liveSettings = {
           const audit = computeAudit(liveSettings);
           auditBus.emit("snapshot", audit);
           detectAlerts(audit);
+          checkDrift(adapter.id);
         } catch (err) {
           console.error(`[live ${adapter.id}]`, err.message);
         }
@@ -151,7 +279,7 @@ const liveSettings = {
 
 function detectAlerts(audit) {
   const profitable = audit.opportunities.filter(
-    (o) => o.netProfit >= liveSettings.threshold
+    (o) => o.profitPerUsdt >= liveSettings.minProfitPerUsdt
   );
   for (const op of profitable) {
     const key = `${op.buy.exchange}>${op.sell.exchange}`;
@@ -172,6 +300,7 @@ function detectAlerts(audit) {
   for (const k of [...lastAlertProfit.keys()]) {
     if (!liveKeys.has(k)) lastAlertProfit.delete(k);
   }
+  pruneRecentAlerts();
 }
 
 function downsample(arr, max) {
@@ -281,6 +410,89 @@ app.get("/api/:exchange/history", withAdapter, (req, res) => {
   });
 });
 
+app.post("/api/:exchange/balance", withAdapter, async (req, res) => {
+  const adapter = req.adapter;
+  if (!adapter.getBalance) {
+    return res
+      .status(501)
+      .json({ ok: false, error: `getBalance not implemented for ${adapter.id}` });
+  }
+  const { apiKey, apiSecret, asset } = req.body || {};
+  if (!apiKey || !apiSecret) {
+    return res.status(400).json({ ok: false, error: "Missing apiKey or apiSecret" });
+  }
+  try {
+    const data = await adapter.getBalance({ apiKey, apiSecret, asset: asset || "USDT" });
+    res.json({ ok: true, data });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const body = err.response?.data;
+    res.status(status).json({
+      ok: false,
+      error: body?.msg || body?.message || err.message || "Balance error",
+      code: body?.code,
+    });
+  }
+});
+
+app.post("/api/:exchange/applied", withAdapter, (req, res) => {
+  const id = req.adapter.id;
+  const { buy, sell, clear } = req.body || {};
+  if (clear) {
+    delete appliedAds[id];
+    return res.json({ ok: true, applied: null });
+  }
+  const norm = (raw) => {
+    if (!raw) return null;
+    const price = Number(raw.price);
+    if (!Number.isFinite(price)) return null;
+    return {
+      adNo: String(raw.adNo || ""),
+      price,
+      targetRank: Math.max(1, Math.min(5, Number(raw.targetRank) || 5)),
+      minProfit: Math.max(0, Number(raw.minProfit) || 0),
+      appliedAt: Date.now(),
+    };
+  };
+  const next = { buy: norm(buy), sell: norm(sell), lastDrift: {} };
+  if (!next.buy && !next.sell) {
+    return res.status(400).json({ ok: false, error: "buy or sell required" });
+  }
+  appliedAds[id] = next;
+  // immediately re-evaluate so a fresh apply that's already drifted fires right away
+  checkDrift(id);
+  res.json({ ok: true, applied: appliedAds[id] });
+});
+
+app.get("/api/:exchange/applied", withAdapter, (req, res) => {
+  res.json({ applied: appliedAds[req.adapter.id] || null });
+});
+
+app.get("/api/:exchange/drift/stream", withAdapter, (req, res) => {
+  const id = req.adapter.id;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  send("hello", { applied: appliedAds[id] || null });
+
+  const bus = getDriftBus(id);
+  const onDrift = (ev) => send("drift", ev);
+  bus.on("drift", onDrift);
+
+  const ka = setInterval(() => res.write(": ka\n\n"), 25_000);
+  req.on("close", () => {
+    clearInterval(ka);
+    bus.off("drift", onDrift);
+  });
+});
+
 app.post("/api/:exchange/update-ad", withAdapter, async (req, res) => {
   const adapter = req.adapter;
   if (!adapter.updateAd) {
@@ -344,7 +556,13 @@ function aggregateBook(orders, amount) {
     const take = Math.min(usdtMaxFromAd, remaining);
     filled += take;
     value += take * o.price;
-    used.push({ price: o.price, merchant: o.merchant, usdt: take });
+    used.push({
+      price: o.price,
+      merchant: o.merchant,
+      usdt: take,
+      maxUsdt: usdtMaxFromAd,
+      trader: o.trader || null,
+    });
   }
   if (filled < amount * 0.999) return null;
   return {
@@ -353,11 +571,12 @@ function aggregateBook(orders, amount) {
     used,
     topPrice: used[0]?.price ?? null,
     topMerchant: used[0]?.merchant ?? null,
+    topAdMaxUsdt: used[0]?.maxUsdt ?? null,
     adsUsed: used.length,
   };
 }
 
-function computeAudit({ amount = 1000, feeOverride = null }) {
+function computeAudit({ amount = 100, feeOverride = null }) {
   const adapters = listAdapters().map((m) => getAdapter(m.id));
   const snapshots = adapters.map((adapter) => {
     const s = getState(adapter.id);
@@ -402,18 +621,22 @@ function computeAudit({ amount = 1000, feeOverride = null }) {
         buy: {
           exchange: buyEx.id,
           label: buyEx.label,
-          price: buyPrice,
-          topPrice: buyEx.bestAsk.topPrice,
+          price: buyEx.bestAsk.topPrice,
+          effectivePrice: buyPrice,
           merchant: buyEx.bestAsk.topMerchant,
+          merchantAvailUsdt: buyEx.bestAsk.topAdMaxUsdt,
           adsUsed: buyEx.bestAsk.adsUsed,
+          fills: buyEx.bestAsk.used,
         },
         sell: {
           exchange: sellEx.id,
           label: sellEx.label,
-          price: sellPrice,
-          topPrice: sellEx.bestBid.topPrice,
+          price: sellEx.bestBid.topPrice,
+          effectivePrice: sellPrice,
           merchant: sellEx.bestBid.topMerchant,
+          merchantAvailUsdt: sellEx.bestBid.topAdMaxUsdt,
           adsUsed: sellEx.bestBid.adsUsed,
+          fills: sellEx.bestBid.used,
         },
         sameExchange: buyEx.id === sellEx.id,
         network: route.network,
@@ -440,15 +663,13 @@ function computeAudit({ amount = 1000, feeOverride = null }) {
 }
 
 app.get("/api/audit", (req, res) => {
-  const amount = Math.max(1000, Number(req.query.amount) || 1000);
-  const feeOverride =
-    req.query.fee === undefined ? null : Math.max(0, Number(req.query.fee));
+  const amount = Math.max(100, Number(req.query.amount) || 100);
   liveSettings.amount = amount;
-  liveSettings.feeOverride = feeOverride;
-  if (req.query.threshold !== undefined) {
-    liveSettings.threshold = Math.max(0, Number(req.query.threshold) || 0);
+  if (req.query.minProfit !== undefined) {
+    const v = Number(req.query.minProfit);
+    if (Number.isFinite(v)) liveSettings.minProfitPerUsdt = v;
   }
-  res.json(computeAudit({ amount, feeOverride }));
+  res.json(computeAudit({ amount, feeOverride: null }));
 });
 
 app.get("/api/audit/stream", (req, res) => {
@@ -463,6 +684,7 @@ app.get("/api/audit/stream", (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  pruneRecentAlerts();
   send("hello", { recentAlerts, settings: liveSettings });
   send("snapshot", computeAudit(liveSettings));
 
@@ -481,12 +703,12 @@ app.get("/api/audit/stream", (req, res) => {
 });
 
 app.post("/api/audit/settings", (req, res) => {
-  const { amount, fee, threshold } = req.body || {};
-  if (amount !== undefined) liveSettings.amount = Math.max(1000, Number(amount) || 1000);
-  if (fee !== undefined)
-    liveSettings.feeOverride = fee === null ? null : Math.max(0, Number(fee));
-  if (threshold !== undefined)
-    liveSettings.threshold = Math.max(0, Number(threshold) || 0);
+  const { amount, minProfit } = req.body || {};
+  if (amount !== undefined) liveSettings.amount = Math.max(100, Number(amount) || 100);
+  if (minProfit !== undefined) {
+    const v = Number(minProfit);
+    if (Number.isFinite(v)) liveSettings.minProfitPerUsdt = v;
+  }
   lastAlertProfit.clear();
   res.json({ ok: true, settings: liveSettings });
 });
