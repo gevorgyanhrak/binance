@@ -130,5 +130,35 @@
     ],
     "createdAt": 1777834946636,
     "updatedAt": 1777836218043
+  },
+  "blessing_fx": {
+    "username": "blessing_fx",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 27,
+      "successfulOrders": 26,
+      "cancelledOrders": 1,
+      "positiveFeedback": null,
+      "negativeFeedback": null,
+      "stars": null
+    },
+    "exchange": "Bybit",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 27,
+          "successfulOrders": 26,
+          "cancelledOrders": 1,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": null
+        },
+        "at": 1777975100701
+      }
+    ],
+    "createdAt": 1777975100701,
+    "updatedAt": 1777975100701
   }
 }

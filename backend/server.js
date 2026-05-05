@@ -1305,6 +1305,54 @@ let cachedFxRate = {
   fetchedAt: 0,
 };
 
+// --- RUB market history tracking (Bybit) ---
+const RUB_HISTORY_FILE = path.join(HISTORY_DIR, "bybit-rub.json");
+const rubState = {
+  history: (() => {
+    try {
+      if (fs.existsSync(RUB_HISTORY_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(RUB_HISTORY_FILE, "utf8"));
+        return Array.isArray(parsed) ? parsed : [];
+      }
+    } catch {}
+    return [];
+  })(),
+  cache: null,
+};
+
+function persistRubHistory() {
+  const cutoff = Date.now() - RETENTION_MS;
+  rubState.history = rubState.history.filter((x) => x.t >= cutoff);
+  fs.writeFile(RUB_HISTORY_FILE, JSON.stringify(rubState.history), () => {});
+}
+
+async function refreshRubMarket() {
+  const adapter = getAdapter("bybit");
+  if (!adapter?.fetchP2P) return;
+  try {
+    const asks = await adapter.fetchP2P({
+      tradeType: "BUY",
+      asset: "USDT",
+      fiat: "RUB",
+    });
+    const t = Date.now();
+    rubState.cache = { asks, t };
+    if (asks.length > 0) {
+      rubState.history.push({
+        t,
+        topPrice: asks[0].price,
+        prices: asks.slice(0, 10).map((o) => o.price),
+        topMerchant: asks[0].merchant,
+      });
+      persistRubHistory();
+    }
+  } catch (err) {
+    console.error("[bybit-rub]", err.message);
+  }
+}
+refreshRubMarket();
+setInterval(refreshRubMarket, REFRESH_INTERVAL_MS);
+
 async function fetchRateAmRubRate() {
   // rate.am exposes data via Next.js RSC streaming; scrape from the page response
   const r = await axios.get(
@@ -1409,6 +1457,85 @@ function aggregateBookForAmount(orders, amount) {
     used,
   };
 }
+
+app.get("/api/rub-arb-history", async (req, res) => {
+  const period = String(req.query.period || "day");
+  const sellExchangeId = String(req.query.sellExchange || "bybit").toLowerCase();
+  const ms =
+    period === "week"
+      ? 7 * 24 * 60 * 60 * 1000
+      : period === "month"
+        ? 30 * 24 * 60 * 60 * 1000
+        : 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - ms;
+  const rubSnaps = (rubState.history || [])
+    .filter((s) => s.t >= cutoff)
+    .map((s) => ({ t: s.t, rubPrice: s.topPrice }));
+  const sellState = state[sellExchangeId];
+  const amdSnaps = ((sellState && sellState.history) || [])
+    .filter((s) => s.t >= cutoff)
+    .map((s) => ({ t: s.t, amdPrice: s.sellPrice }));
+
+  // FX rate for converting RUB->AMD
+  const fxRate = await getRubAmdRate();
+
+  // merge by nearest timestamp, sample down to ~150 points for chart
+  const points = [];
+  let ai = 0;
+  for (const r of rubSnaps) {
+    while (ai + 1 < amdSnaps.length && Math.abs(amdSnaps[ai + 1].t - r.t) < Math.abs(amdSnaps[ai].t - r.t)) {
+      ai++;
+    }
+    const a = amdSnaps[ai];
+    if (!a) continue;
+    if (Math.abs(a.t - r.t) > 5 * 60 * 1000) continue; // skip if no AMD snap within 5 min
+    points.push({
+      t: r.t,
+      rubPrice: r.rubPrice,
+      rubInAmd: fxRate ? r.rubPrice * fxRate : null,
+      amdPrice: a.amdPrice,
+      profitPerUsdt: fxRate ? a.amdPrice - r.rubPrice * fxRate : null,
+    });
+  }
+  // downsample
+  const MAX_POINTS = 200;
+  let sampled = points;
+  if (points.length > MAX_POINTS) {
+    const step = points.length / MAX_POINTS;
+    sampled = [];
+    for (let i = 0; i < MAX_POINTS; i++) {
+      sampled.push(points[Math.floor(i * step)]);
+    }
+    if (sampled[sampled.length - 1] !== points[points.length - 1]) {
+      sampled.push(points[points.length - 1]);
+    }
+  }
+
+  // Aggregates
+  const stat = (xs) => {
+    if (!xs.length) return null;
+    return {
+      min: Math.min(...xs),
+      max: Math.max(...xs),
+      avg: xs.reduce((a, b) => a + b, 0) / xs.length,
+      first: xs[0],
+      last: xs[xs.length - 1],
+    };
+  };
+  res.json({
+    ok: true,
+    period,
+    points: sampled,
+    fxRate,
+    sellExchange: sellExchangeId,
+    rubStats: stat(points.map((p) => p.rubPrice).filter(Number.isFinite)),
+    amdStats: stat(points.map((p) => p.amdPrice).filter(Number.isFinite)),
+    profitStats: stat(
+      points.map((p) => p.profitPerUsdt).filter((v) => Number.isFinite(v))
+    ),
+    samples: points.length,
+  });
+});
 
 app.get("/api/rub-arb", async (req, res) => {
   const amount = Math.max(50, Math.min(1_000_000, Number(req.query.amount) || 1000));
