@@ -116,6 +116,8 @@ async function refresh(adapter) {
         profitPercent: data.profitPercent,
         buyPrices: data.buy.slice(0, 10).map((b) => b.price),
         sellPrices: data.sell.slice(0, 10).map((s) => s.price),
+        buyMerchants: data.buy.slice(0, 10).map((b) => b.merchant),
+        sellMerchants: data.sell.slice(0, 10).map((s) => s.merchant),
       });
       s.history = persistHistory(adapter.id, s.history);
     } catch (err) {
@@ -877,6 +879,152 @@ app.post("/api/:exchange/orders", withAdapter, async (req, res) => {
       code: body?.code,
     });
   }
+});
+
+app.get("/api/:exchange/merchant/:nickname/history", withAdapter, (req, res) => {
+  const days = Math.max(1, Math.min(30, Number(req.query.days) || 7));
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const s = getState(req.adapter.id);
+  const nickname = decodeURIComponent(req.params.nickname);
+  const observations = [];
+  for (const snap of s.history || []) {
+    if (snap.t < cutoff) continue;
+    const buyMs = snap.buyMerchants || [];
+    const sellMs = snap.sellMerchants || [];
+    const buyIdx = buyMs.indexOf(nickname);
+    const sellIdx = sellMs.indexOf(nickname);
+    if (buyIdx >= 0 && snap.buyPrices?.[buyIdx] != null) {
+      observations.push({
+        t: snap.t,
+        side: "ask",
+        price: snap.buyPrices[buyIdx],
+        rank: buyIdx + 1,
+      });
+    }
+    if (sellIdx >= 0 && snap.sellPrices?.[sellIdx] != null) {
+      observations.push({
+        t: snap.t,
+        side: "bid",
+        price: snap.sellPrices[sellIdx],
+        rank: sellIdx + 1,
+      });
+    }
+  }
+  // Aggregate stats per side
+  const askObs = observations.filter((o) => o.side === "ask");
+  const bidObs = observations.filter((o) => o.side === "bid");
+  const stats = (arr) => {
+    if (!arr.length) return null;
+    const prices = arr.map((o) => o.price);
+    const ranks = arr.map((o) => o.rank);
+    const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    return {
+      samples: arr.length,
+      minPrice: Math.min(...prices),
+      maxPrice: Math.max(...prices),
+      avgPrice: Number(avg(prices).toFixed(4)),
+      avgRank: Number(avg(ranks).toFixed(2)),
+      firstSeen: arr[arr.length - 1]?.t,
+      lastSeen: arr[0]?.t,
+    };
+  };
+  res.json({
+    ok: true,
+    nickname,
+    days,
+    count: observations.length,
+    askStats: stats(askObs),
+    bidStats: stats(bidObs),
+    observations: observations.slice(-500), // cap response size
+  });
+});
+
+app.post("/api/:exchange/counterparty/:nickname/summary", withAdapter, async (req, res) => {
+  const adapter = req.adapter;
+  const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const nickname = decodeURIComponent(req.params.nickname);
+  const { apiKey, apiSecret } = req.body || {};
+  // First, refresh local DB from Binance (so summary reflects latest data)
+  let totalFetched = 0;
+  let fetchError = null;
+  if (adapter.getOrders && apiKey && apiSecret) {
+    for (const tradeType of ["BUY", "SELL"]) {
+      try {
+        for (let page = 1; page <= 20; page++) {
+          const data = await adapter.getOrders({
+            apiKey,
+            apiSecret,
+            startTimestamp: cutoff,
+            endTimestamp: Date.now(),
+            page,
+            rows: 100,
+            tradeType,
+          });
+          const rows = data?.data || [];
+          if (rows.length === 0) break;
+          dbApi.saveOrders(adapter.id, rows);
+          totalFetched += rows.length;
+          if (rows.length < 100) break;
+        }
+      } catch (err) {
+        fetchError =
+          err.response?.data?.msg || err.response?.data?.error || err.message;
+        console.error(
+          `[counterparty:${adapter.id}] ${tradeType} fetch failed:`,
+          fetchError
+        );
+        break;
+      }
+    }
+    console.log(
+      `[counterparty:${adapter.id}] fetched ${totalFetched} orders for ${nickname} lookup`
+    );
+  }
+  const rows = dbApi.listOrdersByCounterparty(
+    adapter.id,
+    nickname,
+    cutoff,
+    Date.now(),
+    1000
+  );
+  const completed = rows.filter(
+    (r) => (r.status || "").toUpperCase() === "COMPLETED"
+  );
+  const buys = completed.filter((r) => r.trade_type === "BUY");
+  const sells = completed.filter((r) => r.trade_type === "SELL");
+  const sum = (arr, k) =>
+    arr.reduce((a, x) => a + (parseFloat(x[k]) || 0), 0);
+  const totalUsdtBought = sum(buys, "amount");
+  const totalUsdtSold = sum(sells, "amount");
+  const totalAmdSpent = sum(buys, "total_price");
+  const totalAmdReceived = sum(sells, "total_price");
+  res.json({
+    ok: true,
+    nickname,
+    days,
+    fetched: totalFetched,
+    fetchError,
+    count: rows.length,
+    completed: completed.length,
+    buys: buys.length,
+    sells: sells.length,
+    totalUsdtBought,
+    totalUsdtSold,
+    totalAmdSpent,
+    totalAmdReceived,
+    avgBuyPrice: totalUsdtBought ? totalAmdSpent / totalUsdtBought : null,
+    avgSellPrice: totalUsdtSold ? totalAmdReceived / totalUsdtSold : null,
+    orders: rows.slice(0, 50).map((r) => ({
+      orderNumber: r.order_no,
+      tradeType: r.trade_type,
+      amount: r.amount,
+      unitPrice: r.unit_price,
+      totalPrice: r.total_price,
+      status: r.status,
+      createTime: r.create_time,
+    })),
+  });
 });
 
 app.post("/api/:exchange/balance", withAdapter, async (req, res) => {

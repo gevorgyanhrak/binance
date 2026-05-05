@@ -94,8 +94,8 @@
     "manualRating": null,
     "notes": "",
     "stats": {
-      "totalOrders": 1334,
-      "successfulOrders": 1334,
+      "totalOrders": 1338,
+      "successfulOrders": 1338,
       "cancelledOrders": 0,
       "positiveFeedback": null,
       "negativeFeedback": null,
@@ -103,6 +103,18 @@
     },
     "exchange": "Binance",
     "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 1338,
+          "successfulOrders": 1338,
+          "cancelledOrders": 0,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": 5
+        },
+        "at": 1777836218043
+      },
       {
         "kind": "profile",
         "stats": {
@@ -117,6 +129,6 @@
       }
     ],
     "createdAt": 1777834946636,
-    "updatedAt": 1777834946636
+    "updatedAt": 1777836218043
   }
 }

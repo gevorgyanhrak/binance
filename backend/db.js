@@ -110,6 +110,25 @@ function listOrders(exchange, startMs, endMs, limit = 1000) {
   return stmtListOrders.all(exchange, startMs, endMs, limit);
 }
 
+const stmtListOrdersByCounterparty = db.prepare(`
+  SELECT * FROM orders
+  WHERE exchange = ?
+    AND LOWER(TRIM(counterparty)) = LOWER(TRIM(?))
+    AND create_time >= ? AND create_time <= ?
+  ORDER BY create_time DESC
+  LIMIT ?
+`);
+
+function listOrdersByCounterparty(exchange, counterparty, startMs, endMs, limit = 1000) {
+  return stmtListOrdersByCounterparty.all(
+    exchange,
+    counterparty,
+    startMs,
+    endMs,
+    limit
+  );
+}
+
 const stmtMaxCreateTime = db.prepare(
   "SELECT MAX(create_time) AS t FROM orders WHERE exchange = ?"
 );
@@ -142,6 +161,7 @@ module.exports = {
   kvSet,
   saveOrders,
   listOrders,
+  listOrdersByCounterparty,
   lastOrderTime,
   saveAlert,
   listAlerts,
