@@ -1296,6 +1296,206 @@ function computeAudit({ amount = 100, feeOverride = null }) {
   };
 }
 
+let cachedFxRate = {
+  rate: null,
+  bankBuyAvg: null,
+  bankSellAvg: null,
+  bankBuyBest: null, // highest buy = best for converting RUB to AMD
+  source: null,
+  fetchedAt: 0,
+};
+
+async function fetchRateAmRubRate() {
+  // rate.am exposes data via Next.js RSC streaming; scrape from the page response
+  const r = await axios.get(
+    "https://www.rate.am/hy/armenian-dram-exchange-rates/banks",
+    {
+      timeout: 8000,
+      headers: { RSC: "1", Accept: "*/*", "User-Agent": "Mozilla/5.0" },
+    }
+  );
+  const data = String(r.data || "");
+  const re = /"RUR":\{"CASH":\{"buy":"([0-9.]+)","sell":"([0-9.]+)"\}/g;
+  const buys = [];
+  const sells = [];
+  let m;
+  while ((m = re.exec(data)) !== null) {
+    const b = parseFloat(m[1]);
+    const s = parseFloat(m[2]);
+    if (b > 3 && b < 10) buys.push(b);
+    if (s > 3 && s < 10) sells.push(s);
+  }
+  if (!buys.length) throw new Error("no RUR rates in rate.am response");
+  const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  return {
+    bankBuyAvg: avg(buys),
+    bankSellAvg: sells.length ? avg(sells) : null,
+    bankBuyBest: Math.max(...buys),
+    samples: buys.length,
+  };
+}
+
+async function fetchOpenErApiRubRate() {
+  const r = await axios.get("https://open.er-api.com/v6/latest/RUB", {
+    timeout: 8000,
+  });
+  const rate = r.data?.rates?.AMD;
+  if (!Number.isFinite(rate)) throw new Error("invalid open.er-api response");
+  return rate;
+}
+
+async function getRubAmdRate() {
+  // 30-min cache
+  if (cachedFxRate.rate && Date.now() - cachedFxRate.fetchedAt < 30 * 60 * 1000) {
+    return cachedFxRate.rate;
+  }
+  // Try rate.am first (Armenian bank rates — most relevant)
+  try {
+    const r = await fetchRateAmRubRate();
+    cachedFxRate = {
+      rate: r.bankBuyAvg, // default reference: what banks pay you per RUB
+      bankBuyAvg: r.bankBuyAvg,
+      bankSellAvg: r.bankSellAvg,
+      bankBuyBest: r.bankBuyBest,
+      source: `rate.am (${r.samples} banks)`,
+      fetchedAt: Date.now(),
+    };
+    return cachedFxRate.rate;
+  } catch (err) {
+    console.error("[fx] rate.am fetch failed:", err.message);
+  }
+  // Fallback: open.er-api mid-market
+  try {
+    const rate = await fetchOpenErApiRubRate();
+    cachedFxRate = {
+      rate,
+      bankBuyAvg: null,
+      bankSellAvg: null,
+      bankBuyBest: null,
+      source: "open.er-api.com (mid-market)",
+      fetchedAt: Date.now(),
+    };
+    return rate;
+  } catch (err) {
+    console.error("[fx] open.er-api fallback failed:", err.message);
+  }
+  return cachedFxRate.rate;
+}
+
+function aggregateBookForAmount(orders, amount) {
+  let filled = 0;
+  let value = 0;
+  const used = [];
+  for (const o of orders) {
+    if (filled >= amount) break;
+    if (!Number.isFinite(o.price) || o.price <= 0) continue;
+    const usdtMaxFromAd = o.max / o.price;
+    const usdtMinFromAd = o.min / o.price;
+    const remaining = amount - filled;
+    if (remaining < usdtMinFromAd) continue;
+    const take = Math.min(usdtMaxFromAd, remaining);
+    filled += take;
+    value += take * o.price;
+    used.push({ price: o.price, merchant: o.merchant, usdt: take });
+  }
+  if (filled === 0) return null;
+  return {
+    effectivePrice: value / filled,
+    topPrice: used[0]?.price ?? null,
+    topMerchant: used[0]?.merchant ?? null,
+    usdtFilled: filled,
+    requestedAmount: amount,
+    partialFill: filled < amount * 0.999,
+    used,
+  };
+}
+
+app.get("/api/rub-arb", async (req, res) => {
+  const amount = Math.max(50, Math.min(1_000_000, Number(req.query.amount) || 1000));
+  const rateOverride = Number(req.query.rate);
+  const buyExchangeId = String(req.query.buyExchange || "bybit").toLowerCase();
+  const sellExchangeId = String(req.query.sellExchange || "bybit").toLowerCase();
+  const buyAdapter = getAdapter(buyExchangeId);
+  const sellAdapter = getAdapter(sellExchangeId);
+  if (!buyAdapter?.fetchP2P || !sellAdapter?.fetchP2P) {
+    return res.status(503).json({
+      ok: false,
+      error: `adapter unavailable: ${buyExchangeId} or ${sellExchangeId}`,
+    });
+  }
+  try {
+    const [rubAsks, amdBids, fxRateAuto] = await Promise.all([
+      buyAdapter.fetchP2P({ tradeType: "BUY", asset: "USDT", fiat: "RUB" }),
+      sellAdapter.fetchP2P({ tradeType: "SELL", asset: "USDT", fiat: "AMD" }),
+      Number.isFinite(rateOverride) ? Promise.resolve(rateOverride) : getRubAmdRate(),
+    ]);
+    const rubAggr = aggregateBookForAmount(rubAsks || [], amount);
+    const amdAggr = aggregateBookForAmount(amdBids || [], amount);
+    const fxRate = Number.isFinite(rateOverride) ? rateOverride : fxRateAuto;
+    let profitPerUsdt = null;
+    let totalProfit = null;
+    let costRub = null;
+    let costInAmd = null;
+    let receiveAmd = null;
+    let executable = null;
+    if (rubAggr && amdAggr && Number.isFinite(fxRate)) {
+      // executable size is bounded by both sides
+      executable = Math.min(rubAggr.usdtFilled, amdAggr.usdtFilled);
+      costRub = rubAggr.effectivePrice * executable;
+      costInAmd = costRub * fxRate;
+      receiveAmd = amdAggr.effectivePrice * executable;
+      totalProfit = receiveAmd - costInAmd;
+      profitPerUsdt = totalProfit / executable;
+    }
+    res.json({
+      ok: true,
+      amount,
+      buyExchange: buyExchangeId,
+      sellExchange: sellExchangeId,
+      fxRate,
+      fxRateOverride: Number.isFinite(rateOverride),
+      fxRateSource: Number.isFinite(rateOverride) ? "manual" : cachedFxRate.source,
+      fxRateBankBuyAvg: cachedFxRate.bankBuyAvg,
+      fxRateBankSellAvg: cachedFxRate.bankSellAvg,
+      fxRateBankBuyBest: cachedFxRate.bankBuyBest,
+      fxRateAge: cachedFxRate.fetchedAt
+        ? Date.now() - cachedFxRate.fetchedAt
+        : null,
+      rub: {
+        asks: (rubAsks || []).slice(0, 10).map((o) => ({
+          price: o.price,
+          min: o.min,
+          max: o.max,
+          merchant: o.merchant,
+          trader: o.trader || null,
+        })),
+        aggregate: rubAggr,
+      },
+      amd: {
+        bids: (amdBids || []).slice(0, 10).map((o) => ({
+          price: o.price,
+          min: o.min,
+          max: o.max,
+          merchant: o.merchant,
+          trader: o.trader || null,
+        })),
+        aggregate: amdAggr,
+      },
+      math: {
+        executable,
+        costRub,
+        costInAmd,
+        receiveAmd,
+        totalProfit,
+        profitPerUsdt,
+      },
+      generatedAt: Date.now(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get("/api/audit", (req, res) => {
   const amount = Math.max(100, Number(req.query.amount) || 100);
   liveSettings.amount = amount;
