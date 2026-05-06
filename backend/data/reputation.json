@@ -160,5 +160,35 @@
     ],
     "createdAt": 1777975100701,
     "updatedAt": 1777975100701
+  },
+  "anush1": {
+    "username": "anush1",
+    "manualRating": null,
+    "notes": "",
+    "stats": {
+      "totalOrders": 21,
+      "successfulOrders": 21,
+      "cancelledOrders": 0,
+      "positiveFeedback": null,
+      "negativeFeedback": null,
+      "stars": null
+    },
+    "exchange": "Bybit",
+    "history": [
+      {
+        "kind": "profile",
+        "stats": {
+          "totalOrders": 21,
+          "successfulOrders": 21,
+          "cancelledOrders": 0,
+          "positiveFeedback": null,
+          "negativeFeedback": null,
+          "stars": null
+        },
+        "at": 1777982437176
+      }
+    ],
+    "createdAt": 1777982437176,
+    "updatedAt": 1777982437176
   }
 }

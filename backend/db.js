@@ -44,6 +44,26 @@ CREATE TABLE IF NOT EXISTS alerts (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at);
+
+CREATE TABLE IF NOT EXISTS cycles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  principal_rub REAL NOT NULL,
+  forward_rub_spent REAL,
+  forward_rub_buy_price REAL,
+  usdt_acquired REAL,
+  forward_amd_sell_price REAL,
+  amd_received REAL,
+  back_method TEXT,
+  amd_per_rub REAL,
+  amd_to_restore_rub REAL,
+  profit_amd REAL,
+  profit_pct REAL,
+  decision TEXT,
+  note TEXT,
+  payload TEXT NOT NULL,
+  executed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cycles_executed ON cycles(executed_at);
 `);
 
 const stmtGetKv = db.prepare("SELECT value FROM kv WHERE key = ?");
@@ -155,6 +175,72 @@ function listAlerts(sinceMs, limit = 200) {
   }));
 }
 
+const stmtInsertCycle = db.prepare(`
+  INSERT INTO cycles(
+    principal_rub, forward_rub_spent, forward_rub_buy_price, usdt_acquired,
+    forward_amd_sell_price, amd_received, back_method, amd_per_rub,
+    amd_to_restore_rub, profit_amd, profit_pct, decision, note, payload, executed_at
+  ) VALUES(
+    @principal_rub, @forward_rub_spent, @forward_rub_buy_price, @usdt_acquired,
+    @forward_amd_sell_price, @amd_received, @back_method, @amd_per_rub,
+    @amd_to_restore_rub, @profit_amd, @profit_pct, @decision, @note, @payload, @executed_at
+  )
+`);
+
+function saveCycle(snap, note = null) {
+  if (!snap || !snap.ok) return null;
+  const row = {
+    principal_rub: snap.principalRub,
+    forward_rub_spent: snap.forward?.rubSpent ?? null,
+    forward_rub_buy_price: snap.forward?.rubBuyPrice ?? null,
+    usdt_acquired: snap.forward?.usdtAcquired ?? null,
+    forward_amd_sell_price: snap.forward?.amdSellPrice ?? null,
+    amd_received: snap.forward?.amdReceived ?? null,
+    back_method: snap.back?.methodUsed ?? null,
+    amd_per_rub: snap.back?.amdPerRub ?? null,
+    amd_to_restore_rub: snap.back?.amdToRestoreRub ?? null,
+    profit_amd: snap.profitAmd ?? null,
+    profit_pct: snap.profitPct ?? null,
+    decision: snap.decision ?? null,
+    note: note || null,
+    payload: JSON.stringify(snap),
+    executed_at: snap.t || Date.now(),
+  };
+  const result = stmtInsertCycle.run(row);
+  return result.lastInsertRowid;
+}
+
+const stmtListCycles = db.prepare(
+  "SELECT * FROM cycles WHERE executed_at >= ? ORDER BY executed_at DESC LIMIT ?"
+);
+function listCycles(sinceMs = 0, limit = 200) {
+  return stmtListCycles.all(sinceMs, limit).map((r) => ({
+    id: r.id,
+    principalRub: r.principal_rub,
+    forwardRubSpent: r.forward_rub_spent,
+    forwardRubBuyPrice: r.forward_rub_buy_price,
+    usdtAcquired: r.usdt_acquired,
+    forwardAmdSellPrice: r.forward_amd_sell_price,
+    amdReceived: r.amd_received,
+    backMethod: r.back_method,
+    amdPerRub: r.amd_per_rub,
+    amdToRestoreRub: r.amd_to_restore_rub,
+    profitAmd: r.profit_amd,
+    profitPct: r.profit_pct,
+    decision: r.decision,
+    note: r.note,
+    t: r.executed_at,
+  }));
+}
+
+const stmtSumProfit = db.prepare(
+  "SELECT COUNT(*) AS n, COALESCE(SUM(profit_amd), 0) AS total FROM cycles WHERE decision = 'GO' AND profit_amd IS NOT NULL"
+);
+function cycleStats() {
+  const r = stmtSumProfit.get();
+  return { count: r?.n || 0, totalProfitAmd: r?.total || 0 };
+}
+
 module.exports = {
   db,
   kvGet,
@@ -165,4 +251,7 @@ module.exports = {
   lastOrderTime,
   saveAlert,
   listAlerts,
+  saveCycle,
+  listCycles,
+  cycleStats,
 };

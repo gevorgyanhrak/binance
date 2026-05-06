@@ -7,6 +7,8 @@ const { EventEmitter } = require("events");
 const { getAdapter, listAdapters } = require("./adapters");
 const riskRouter = require("./risk/routes");
 const dbApi = require("./db");
+const strategy = require("./strategy");
+const cycleEngine = require("./cycle");
 
 const app = express();
 app.use(cors());
@@ -1457,6 +1459,147 @@ function aggregateBookForAmount(orders, amount) {
     used,
   };
 }
+
+// --- Strategy / arbitrage decision engine ---
+let lastStrategySnapshot = null;
+async function runStrategySnapshot() {
+  try {
+    lastStrategySnapshot = await strategy.computeStrategy({
+      getAdapter,
+      amountUsdt: 1000,
+    });
+  } catch (err) {
+    console.error("[strategy]", err.message);
+  }
+}
+runStrategySnapshot();
+setInterval(runStrategySnapshot, 30_000);
+
+app.get("/api/strategy/snapshot", async (req, res) => {
+  if (req.query.fresh === "1") {
+    await runStrategySnapshot();
+  }
+  res.json(lastStrategySnapshot || { ok: false, error: "not ready" });
+});
+
+// ===== Profit-Lock Cycle Engine =====
+let lastCycleSnapshot = null;
+async function runCycleSnapshot({ principalRub, backMethod }) {
+  try {
+    const snap = await cycleEngine.computeCycle({
+      getAdapter,
+      principalRub: Number(principalRub) || 10000,
+      backMethod: backMethod === "bank" ? "bank" : "reverse_p2p",
+    });
+    lastCycleSnapshot = snap;
+    return snap;
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+app.get("/api/cycle/snapshot", async (req, res) => {
+  const principal = Number(req.query.principal) || 10000;
+  const backMethod = req.query.backMethod === "bank" ? "bank" : "reverse_p2p";
+  const fresh = req.query.fresh === "1" || !lastCycleSnapshot;
+  if (fresh) {
+    const snap = await runCycleSnapshot({ principalRub: principal, backMethod });
+    return res.json(snap);
+  }
+  res.json(lastCycleSnapshot || { ok: false, error: "not ready" });
+});
+
+app.post("/api/cycle/log", async (req, res) => {
+  const { principalRub, backMethod, note, snapshot } = req.body || {};
+  let snap = snapshot;
+  if (!snap || !snap.ok) {
+    snap = await runCycleSnapshot({
+      principalRub: Number(principalRub) || 10000,
+      backMethod,
+    });
+  }
+  if (!snap?.ok) {
+    return res.status(400).json({ ok: false, error: snap?.error || "no snapshot" });
+  }
+  const id = dbApi.saveCycle(snap, note || null);
+  res.json({ ok: true, id, snapshot: snap });
+});
+
+app.get("/api/cycle/ledger", (req, res) => {
+  const sinceMs = Number(req.query.sinceMs) || 0;
+  const limit = Math.min(Number(req.query.limit) || 200, 1000);
+  const items = dbApi.listCycles(sinceMs, limit);
+  const stats = dbApi.cycleStats();
+  res.json({ ok: true, items, stats });
+});
+
+// Telegram bot command long-polling
+let tgUpdateOffset = 0;
+async function pollTelegramCommands() {
+  if (!telegramSettings.botToken) return;
+  try {
+    const r = await axios.get(
+      `https://api.telegram.org/bot${telegramSettings.botToken}/getUpdates`,
+      { params: { offset: tgUpdateOffset, timeout: 25 }, timeout: 30000 }
+    );
+    for (const update of r.data?.result || []) {
+      tgUpdateOffset = update.update_id + 1;
+      const msg = update.message;
+      if (!msg || !msg.text) continue;
+      // Only accept commands from configured chat (if set)
+      if (
+        telegramSettings.chatId &&
+        String(msg.chat.id) !== String(telegramSettings.chatId)
+      ) {
+        continue;
+      }
+      const cmd = msg.text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
+      let reply = null;
+      if (cmd === "/start" || cmd === "/help") {
+        reply = strategy.HELP;
+      } else if (cmd === "/status") {
+        const snap = await strategy.computeStrategy({
+          getAdapter,
+          amountUsdt: 1000,
+        });
+        lastStrategySnapshot = snap;
+        reply = strategy.formatStatus(snap);
+      } else if (cmd === "/opportunity") {
+        const snap = await strategy.computeStrategy({
+          getAdapter,
+          amountUsdt: 1000,
+        });
+        lastStrategySnapshot = snap;
+        reply = strategy.formatOpportunity(snap);
+      } else if (cmd === "/reinvest") {
+        const snap = await strategy.computeStrategy({
+          getAdapter,
+          amountUsdt: 1000,
+        });
+        lastStrategySnapshot = snap;
+        reply = strategy.formatReinvest(snap);
+      } else if (cmd === "/risk") {
+        const snap = await strategy.computeStrategy({
+          getAdapter,
+          amountUsdt: 1000,
+        });
+        lastStrategySnapshot = snap;
+        reply = strategy.formatRisk(snap);
+      }
+      if (reply) {
+        await sendTelegram(reply);
+      }
+    }
+  } catch (err) {
+    // long poll timeout is normal — only log real errors
+    if (err.code !== "ECONNABORTED" && err.response?.status !== 502) {
+      console.error("[telegram-poll]", err.response?.status || err.message);
+    }
+  } finally {
+    setTimeout(pollTelegramCommands, 1000);
+  }
+}
+pollTelegramCommands();
 
 app.get("/api/rub-arb-history", async (req, res) => {
   const period = String(req.query.period || "day");
